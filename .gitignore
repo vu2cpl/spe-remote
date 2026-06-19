@@ -6,3 +6,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Marker written after first-time ./configure.sh so setup.sh doesn't re-prompt.
+.configured

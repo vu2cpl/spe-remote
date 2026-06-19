@@ -21,6 +21,7 @@ A modern Python 3 remote control server for **SPE Expert** HF amplifiers (1.3K-F
 - **Threaded reader + async writer** — blocking reads survive USB-serial poll glitches that crash `serial_asyncio`
 - **Graceful shutdown** — SIGINT/SIGTERM handler cancels tasks and closes the port cleanly
 - **Configurable** — YAML config file for serial port, baud rate, polling intervals
+- **Guided setup** — `./configure.sh` lists the Pi's `/dev/serial/by-id/` ports to pick from, walks you through the optional Flex radio, and keeps your saved settings on re-run; `sudo ./install-service.sh --update` re-configures and restarts the live service with a diff preview
 
 ## How It Works — One Server, Many Clients
 
@@ -108,7 +109,26 @@ sudo usermod -aG dialout $USER
 
 ### 4. Configure
 
-Edit `config.yaml` to match your setup:
+The easiest path is the **interactive configurator**, which `setup.sh` runs
+for you automatically the first time. You can also run it any time:
+
+```bash
+./configure.sh
+```
+
+On a Raspberry Pi it **lists the serial-port aliases under `/dev/serial/by-id/`
+and lets you pick the right one** — no need to hunt for the path by hand. It
+then offers to set up the **optional Flex radio** (orchestrated TUNE + band
+sweep); just answer **no** to skip it if you don't have a Flex. Anything you've
+already configured is offered as the default, so **re-running never loses your
+serial port or Flex IP** — press Enter to keep them. Nothing is written until
+you've reviewed a diff and confirmed.
+
+> The configurator only edits the host-specific keys (serial port and the
+> `flex:` block) using comment-preserving in-place substitutions, so the rest
+> of `config.yaml` — including all the explanatory comments — is left intact.
+
+Prefer to edit by hand? `config.yaml` is plain YAML — here's the full shape:
 
 ```yaml
 serial:
@@ -166,11 +186,24 @@ sudo ./install-service.sh
 
 That's it. The installer auto-detects your user and the install path, adds you to the `dialout` group if needed, and registers `spe-remote` with systemd so it starts on boot and restarts on failure.
 
+Re-installing is safe: **`install-service.sh` never touches `config.yaml`**, so
+your saved serial port and Flex IP are preserved across upgrades.
+
+**Changing the serial port or Flex radio later** — use the `--update` flag. It
+re-runs the interactive configurator (which keeps your current values unless you
+change them), **shows a diff of what will change**, and then restarts the running
+service so the new config takes effect:
+
+```bash
+sudo ./install-service.sh --update
+```
+
 Useful commands afterwards:
 
 ```bash
 sudo systemctl status spe-remote      # is it running?
-sudo systemctl restart spe-remote     # apply config.yaml changes
+sudo ./install-service.sh --update    # change serial port / Flex IP, then restart
+sudo systemctl restart spe-remote     # restart after a hand-edit of config.yaml
 sudo journalctl -u spe-remote -f      # tail logs live
 sudo ./uninstall-service.sh           # remove the service later
 ```

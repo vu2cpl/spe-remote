@@ -1,7 +1,34 @@
 #!/bin/bash
-# Install spe-remote as a systemd service and start it.
-# Run as: sudo ./install-service.sh
+# Install or update the spe-remote systemd service.
+#
+#   sudo ./install-service.sh             install (or re-install) the service.
+#                                         Existing config.yaml is left untouched,
+#                                         so the serial port and Flex IP are kept.
+#   sudo ./install-service.sh --update    re-run the interactive configurator
+#                                         (shows a diff, lets you keep the saved
+#                                         port + Flex IP), then restart the
+#                                         running service with the new config.
+#   sudo ./install-service.sh --help      show this help.
 set -e
+
+RECONFIGURE=0
+for arg in "$@"; do
+    case "$arg" in
+        --update | --reconfigure)
+            RECONFIGURE=1
+            ;;
+        -h | --help)
+            # Print the leading comment block (minus the shebang) as help.
+            awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg" >&2
+            echo "Try: sudo ./install-service.sh --help" >&2
+            exit 1
+            ;;
+    esac
+done
 
 if [ "$EUID" -ne 0 ]; then
     echo "This script must be run with sudo:"
@@ -35,6 +62,21 @@ if id "$USER_NAME" | grep -qv "dialout"; then
     echo "Note: user $USER_NAME is not in the 'dialout' group."
     echo "      Adding it now (takes effect after next login)."
     usermod -aG dialout "$USER_NAME"
+fi
+
+# --update / --reconfigure: re-run the interactive configurator before we
+# restart the service. Run it as the regular user (not root) so config.yaml
+# stays owned by the service user — the dashboard rewrites this file in place
+# (e.g. the °C/°F toggle) and must keep write access to it.
+if [ "$RECONFIGURE" -eq 1 ]; then
+    echo "Updating configuration before restarting the service..."
+    echo
+    if [ ! -x "$WORK_DIR/configure.sh" ]; then
+        echo "configure.sh not found or not executable at $WORK_DIR" >&2
+        exit 1
+    fi
+    sudo -u "$USER_NAME" bash "$WORK_DIR/configure.sh"
+    echo
 fi
 
 SERVICE_NAME="spe-remote"
@@ -92,6 +134,10 @@ Useful commands:
   sudo systemctl stop $SERVICE_NAME
   sudo journalctl -u $SERVICE_NAME -f       # live logs
   sudo journalctl -u $SERVICE_NAME -n 100   # last 100 lines
+
+Change the serial port or Flex radio later (shows a diff, keeps your
+saved settings unless you change them, then restarts the service):
+  sudo ./install-service.sh --update
 
 Open the dashboard:  http://$(hostname -I | awk '{print $1}'):8888/
 
