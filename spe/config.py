@@ -55,6 +55,33 @@ class FlexConfig:
 
 
 @dataclass
+class TciConfig:
+    """Connection to an ExpertSDR3 / SunSDR radio over TCI.
+
+    TCI is the WebSocket text protocol Expert Electronics radios speak
+    (default port 50001). An alternative tune backend to Flex — see
+    spe/tci.py. ``trx`` selects which receiver to key.
+    """
+    host: str = "127.0.0.1"     # ExpertSDR3 / SunSDR TCI host
+    port: int = 50001           # TCI WebSocket port
+    trx: int = 0                # which TRX/receiver to drive (0 or 1)
+    mode: str = "CW"            # mode set on the tuned TRX
+    tune_drive: int = 0         # tune-power percent; 0 ⇒ leave to ExpertSDR
+
+
+@dataclass
+class RadioConfig:
+    """Which tune backend is active.
+
+    ``kind`` selects the radio family the tune orchestrator drives:
+    ``"flex"`` (SmartSDR), ``"tci"`` (ExpertSDR3 / SunSDR), or ``"none"``
+    (no rig — tune commands fail cleanly). Clients can change this at
+    runtime over the WebSocket; it persists back to config.yaml.
+    """
+    kind: str = "none"          # flex | tci | none
+
+
+@dataclass
 class AmpConfig:
     """Amp-side characteristics that the protocol doesn't report.
 
@@ -73,6 +100,8 @@ class AppConfig:
     polling: PollingConfig = field(default_factory=PollingConfig)
     amp: AmpConfig = field(default_factory=AmpConfig)
     flex: FlexConfig = field(default_factory=FlexConfig)
+    tci: TciConfig = field(default_factory=TciConfig)
+    radio: RadioConfig = field(default_factory=RadioConfig)
     log_level: str = "INFO"
 
 
@@ -114,6 +143,93 @@ def persist_temperature_unit(unit: str, path: str = "config.yaml") -> bool:
         return False
 
 
+def _fmt_value(value) -> str:
+    """Format a Python value as the YAML scalar to write. Booleans →
+    true/false, ints bare, strings quoted only when they look like a host
+    (contain a dot/colon) or are empty — matching config.yaml's style
+    (hosts quoted, barewords like ``flex``/``CW`` unquoted)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    s = str(value)
+    if s == "" or "." in s or ":" in s:
+        return '"%s"' % s
+    return s
+
+
+_SECTION_HDR = re.compile(r"^([A-Za-z0-9_]+):\s*(#.*)?$")
+_KEY_LINE = re.compile(r"^(\s+)([A-Za-z0-9_]+)(\s*:\s*)(.*?)(\s+#.*)?\s*$")
+
+
+def persist_values(changes: dict, path: str = "config.yaml") -> bool:
+    """Write ``changes`` into ``config.yaml`` in place, preserving comments.
+
+    ``changes`` maps dotted ``"section.key"`` to a value. Uses section-aware
+    line substitution (the same comment-preserving approach as
+    :func:`persist_temperature_unit`) so the rest of the file — including
+    all explanatory comments — survives. Keys not present are inserted under
+    their section (creating the section if needed). Returns True on success.
+    """
+    p = Path(path)
+    if not p.exists():
+        logger.warning(f"Cannot persist config: {path} does not exist")
+        return False
+
+    by_section: dict = {}
+    for dotted, val in changes.items():
+        section, key = dotted.split(".", 1)
+        by_section.setdefault(section, {})[key] = val
+    remaining = {(s, k) for s, kv in by_section.items() for k in kv}
+
+    text = p.read_text()
+    out, cur = [], None
+    for line in text.split("\n"):
+        m = _SECTION_HDR.match(line)
+        if m:
+            cur = m.group(1)
+            out.append(line)
+            continue
+        if cur in by_section:
+            km = _KEY_LINE.match(line)
+            if km and km.group(2) in by_section[cur]:
+                indent, k, sep, _old, comment = km.groups()
+                out.append(f"{indent}{k}{sep}{_fmt_value(by_section[cur][k])}{comment or ''}")
+                remaining.discard((cur, k))
+                continue
+        out.append(line)
+
+    # Insert any keys/sections that didn't already exist.
+    for section in by_section:
+        missing = {k: by_section[section][k] for s, k in remaining if s == section}
+        if not missing:
+            continue
+        block = [f"  {k}: {_fmt_value(v)}" for k, v in missing.items()]
+        hdr_idx = next(
+            (i for i, l in enumerate(out)
+             if re.match(rf"^{re.escape(section)}:\s*(#.*)?$", l)),
+            None,
+        )
+        if hdr_idx is not None:
+            out[hdr_idx + 1:hdr_idx + 1] = block
+        else:
+            if out and out[-1].strip() != "":
+                out.append("")
+            out.append(f"{section}:")
+            out.extend(block)
+
+    new_text = "\n".join(out)
+    if new_text == text:
+        return True
+    try:
+        p.write_text(new_text)
+        logger.info(f"Persisted {len(changes)} config value(s) to {path}")
+        return True
+    except OSError as e:
+        logger.warning(f"Failed to persist config: {e}")
+        return False
+
+
 def load_config(path: str = "config.yaml") -> AppConfig:
     config = AppConfig()
     config_path = Path(path)
@@ -150,6 +266,22 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             for k, v in raw["flex"].items():
                 if hasattr(config.flex, k):
                     setattr(config.flex, k, v)
+
+        if "tci" in raw:
+            for k, v in raw["tci"].items():
+                if hasattr(config.tci, k):
+                    setattr(config.tci, k, v)
+
+        if "radio" in raw and raw["radio"].get("kind"):
+            config.radio.kind = str(raw["radio"]["kind"]).strip().lower()
+        else:
+            # Back-compat: configs written before the radio.kind selector
+            # only had flex.enabled. Treat enabled Flex as kind=flex so
+            # existing installs keep working untouched.
+            config.radio.kind = "flex" if config.flex.enabled else "none"
+        if config.radio.kind not in ("flex", "tci", "none"):
+            logger.warning(f"Unknown radio.kind {config.radio.kind!r}; using 'none'")
+            config.radio.kind = "none"
 
         if "logging" in raw:
             config.log_level = raw["logging"].get("level", "INFO")

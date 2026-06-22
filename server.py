@@ -21,7 +21,7 @@ from spe.app import make_app
 from spe.serial_handler import SerialHandler
 from spe.power_control import PowerController
 from spe.websocket_handler import AmplifierWebSocket
-from spe.flex import FlexConnection, discover as flex_discover
+from spe.radio_controller import RadioController
 from spe.tune_orchestrator import TuneOrchestrator
 
 
@@ -116,64 +116,39 @@ def main() -> None:
         serial_handler=serial_handler,
     )
 
-    # Optional Flex 6000 control — Phase 2 of the band-sweep work.
-    # When flex.enabled is true, connect to SmartSDR's TCP API and
-    # create a tune orchestrator that can drive an ATU tune cycle via
-    # the (SPE TUNE keycode + Flex carrier) combination. flex.host
-    # picks the radio: set explicitly to an IP, or leave empty to
-    # auto-discover via the SmartSDR UDP broadcast on port 4992.
-    # Disabled by default; spe-remote behaves exactly as before when
-    # the section is omitted from config.yaml.
-    flex_connection = None
-    tune_orchestrator = None
-    if config.flex.enabled:
-        flex_host = config.flex.host
-        if not flex_host:
-            logger.info(
-                "Flex: flex.host empty — listening for SmartSDR discovery "
-                "broadcast on UDP 4992 (up to 5s)…"
-            )
-            # Run discovery synchronously here; spe-remote startup blocks
-            # on it for a few seconds at most. Doing this on the main
-            # loop is fine because nothing else is running yet — the
-            # serial reader / tornado IOLoop haven't started.
-            try:
-                discovery = asyncio.get_event_loop().run_until_complete(
-                    flex_discover()
-                )
-            except Exception:
-                logger.exception("Flex discovery raised; skipping")
-                discovery = None
-            if discovery and discovery.get("ip"):
-                flex_host = discovery["ip"]
-                logger.info(
-                    f"Flex: discovered {discovery.get('model','?')} "
-                    f"\"{discovery.get('nickname','?')}\" "
-                    f"({discovery.get('callsign','?')}) at {flex_host}"
-                )
-            else:
-                logger.warning(
-                    "Flex: discovery timed out and flex.host is empty — "
-                    "Flex disabled for this session"
-                )
-        if flex_host:
-            flex_connection = FlexConnection(flex_host, config.flex.port)
-            tune_orchestrator = TuneOrchestrator(
-                serial_handler=serial_handler,
-                flex=flex_connection,
-                config=config.flex,
-                on_status=AmplifierWebSocket.broadcast_tune_event,
-            )
-            logger.info(
-                f"Flex control enabled: host={flex_host}:{config.flex.port} "
-                f"slice={config.flex.slice_rx} "
-                f"tune_power={config.flex.tune_power_watts}W"
-            )
+    # Optional radio control for orchestrated TUNE + band sweep. The
+    # RadioController drives the rig chosen by radio.kind — a FlexRadio
+    # 6000 over SmartSDR ("flex") or an ExpertSDR3/SunSDR over TCI
+    # ("tci") — through one generic interface. "none" disables tuning.
+    #
+    # On-demand lifecycle: the controller does NOT open the control
+    # session at startup. It connects when a client opens its Sweep menu
+    # (the radio_connect WS command) or, as a safety net, lazily at the
+    # start of a tune cycle, and disconnects when the cycle is over. The
+    # active kind/settings can be changed live by a client (set_radio_config)
+    # without a restart. Always built so a client can switch a "none" config
+    # to flex/tci at runtime; tunes simply FAIL while kind == "none".
+    radio_controller = RadioController(
+        config.radio, config.flex, config.tci,
+        on_status=AmplifierWebSocket.broadcast_tune_event,
+    )
+    tune_orchestrator = TuneOrchestrator(
+        serial_handler=serial_handler,
+        radio_controller=radio_controller,
+        on_status=AmplifierWebSocket.broadcast_tune_event,
+    )
+    logger.info(
+        "Radio control: kind=%s — connects on Sweep-menu open / tune start",
+        config.radio.kind,
+    )
 
     AmplifierWebSocket.configure(
         serial_handler=serial_handler,
         power_controller=power_controller,
         tune_orchestrator=tune_orchestrator,
+        radio_controller=radio_controller,
+        app_config=config,
+        config_path=config_path,
         heartbeat=config.polling.heartbeat,
     )
 
@@ -222,33 +197,15 @@ def main() -> None:
         f"(amp_alive_threshold={config.polling.amp_alive_threshold:.1f}s)"
     )
 
-    # If a Flex is configured, kick off a connect task. Failure here
-    # shouldn't take down the whole server — clients can still talk to
-    # the amp; the tune commands will surface a clear error message
-    # back through the WS instead.
-    flex_task = None
-    if flex_connection is not None:
-        async def _flex_connect():
-            try:
-                await flex_connection.connect()
-                logger.info(
-                    f"Flex: connected (version={flex_connection.radio_version!r}, "
-                    f"handle={flex_connection.client_handle!r})"
-                )
-            except Exception:
-                logger.exception(
-                    "Flex: initial connect failed; tune_single will retry "
-                    "on each command"
-                )
-        flex_task = loop.create_task(_flex_connect())
+    # No radio connect at startup — the RadioController opens the control
+    # session on demand (Sweep-menu open / tune start) and closes it when
+    # the cycle is over. See the on-demand lifecycle note above.
 
     try:
         tornado.ioloop.IOLoop.current().start()
     finally:
         # Ensure background tasks are cancelled if still running
         cleanup_tasks = [serial_task, heartbeat_task]
-        if flex_task is not None:
-            cleanup_tasks.append(flex_task)
         for task in cleanup_tasks:
             try:
                 if not task.done():
@@ -256,12 +213,12 @@ def main() -> None:
             except Exception:
                 pass
 
-        # Close the Flex socket so we don't leak a half-open TCP session.
-        if flex_connection is not None:
+        # Close the radio socket if a tune cycle left it open.
+        if radio_controller is not None:
             try:
-                loop.run_until_complete(flex_connection.close())
+                loop.run_until_complete(radio_controller.disconnect())
             except Exception:
-                logger.exception("Error while closing Flex connection")
+                logger.exception("Error while closing radio connection")
 
         # Make a best-effort to stop serial handler and close resources
         try:

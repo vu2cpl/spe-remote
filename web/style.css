@@ -435,3 +435,24 @@ h1 span { color: var(--accent); font-weight: 600; }
   line-height: 1.35;
 }
 .sweep-note strong { color: var(--text, #d4d8e8); }
+
+/* Radio settings panel rows (client-selected radio) */
+.radio-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+.radio-row label {
+  flex: 0 0 64px;
+  font-size: 12px;
+  color: var(--muted, #9aa);
+}
+.radio-row input,
+.radio-row select {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 13px;
+}

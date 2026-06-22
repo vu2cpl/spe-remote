@@ -85,6 +85,43 @@
     <button class="btn" onclick="sendCmd('band_dn')">BAND &minus;</button>
     <button class="btn" onclick="sendCmd('band_up')">BAND +</button>
     <button class="btn" id="btnSweep" onclick="toggleSweepPanel()">SWEEP</button>
+    <button class="btn" id="btnRadioCfg" onclick="toggleRadioPanel()">RADIO</button>
+  </div>
+
+  <!-- Radio settings panel — pick which rig drives the tune/sweep and
+       edit its connection settings. Applies live on the Pi. -->
+  <div class="sweep-panel" id="radioPanel" hidden>
+    <div class="sweep-header">
+      <span>Radio for TUNE / Sweep</span>
+      <button class="sweep-close" onclick="toggleRadioPanel()" aria-label="Close">&times;</button>
+    </div>
+    <div class="radio-row">
+      <label for="radioKind">Radio</label>
+      <select id="radioKind" onchange="onRadioKindChange()">
+        <option value="none">None</option>
+        <option value="flex">FlexRadio (SmartSDR)</option>
+        <option value="tci">SunSDR / ExpertSDR3 (TCI)</option>
+      </select>
+    </div>
+    <div id="flexFields" hidden>
+      <div class="radio-row"><label for="flexHost">Host</label><input id="flexHost" placeholder="empty = auto-discover"></div>
+      <div class="radio-row"><label for="flexPort">Port</label><input id="flexPort" type="number" value="4992"></div>
+      <div class="radio-row"><label for="flexSlice">Slice</label><input id="flexSlice" type="number" value="0"></div>
+      <div class="radio-row"><label for="flexPower">Tune W</label><input id="flexPower" type="number" value="10"></div>
+    </div>
+    <div id="tciFields" hidden>
+      <div class="radio-row"><label for="tciHost">Host</label><input id="tciHost" placeholder="127.0.0.1"></div>
+      <div class="radio-row"><label for="tciPort">Port</label><input id="tciPort" type="number" value="50001"></div>
+      <div class="radio-row"><label for="tciTrx">TRX</label><input id="tciTrx" type="number" value="0"></div>
+      <div class="radio-row"><label for="tciMode">Mode</label><input id="tciMode" value="CW"></div>
+      <div class="radio-row"><label for="tciDrive">Tune %</label><input id="tciDrive" type="number" value="0"></div>
+    </div>
+    <div class="sweep-controls">
+      <button class="btn sweep-start" onclick="applyRadioConfig()">Apply</button>
+    </div>
+    <div class="sweep-note">
+      Switching radios disconnects the current rig and applies immediately — no restart. Refused while a tune is running.
+    </div>
   </div>
 
   <!-- ATU band-sweep panel (orchestrated via spe-remote tune_band).

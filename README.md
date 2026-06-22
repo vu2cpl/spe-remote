@@ -10,7 +10,8 @@ A modern Python 3 remote control server for **SPE Expert** HF amplifiers (1.3K-F
 - **Power On/Off** — remote power control via DTR line (on) and serial command 0x0A (off)
 - **Full SPE protocol** — all commands from the official Application Programmer's Guide Rev 1.1, plus undocumented RCU commands
 - **RCU (Remote Control Unit) mode** — live LCD display mirror streamed as binary frames; compatible with the MacExpert companion app
-- **Orchestrated TUNE + band sweep** — drives a Flex 6000-series rig over SmartSDR TCP API; runs the SM5TOG-style ATU tune flow (carrier on → watch RCU TUNE-LED bit → carrier off) and sweeps the SPE manual's full sub-band table on demand. Opt-in via the `flex:` config section. Triggerable from MacExpert's SWEEP panel, the bundled web dashboard's SWEEP button, the Node-RED `/ui` SPE panel, and the Vue `/shack` SPE card — all four UIs read the same `tune_event` broadcasts.
+- **Orchestrated TUNE + band sweep (multi-radio)** — drives a transmit rig to key a clean carrier while the SPE's ATU sweeps: a **FlexRadio 6000** over SmartSDR **or** an **Expert Electronics SunSDR / ExpertSDR3** over TCI. Runs the SM5TOG-style ATU tune flow (carrier on → watch RCU TUNE-LED bit → carrier off) and sweeps the SPE manual's full sub-band table on demand. The active rig is chosen by `radio.kind` and can be picked/configured live from the client. Triggerable from MacExpert's SWEEP panel, the bundled web dashboard's SWEEP button, the Node-RED `/ui` SPE panel, and the Vue `/shack` SPE card — all read the same `tune_event` broadcasts.
+- **Client-selected radio** — the operator picks Flex vs SunSDR and edits host/port/etc from the client (a `RADIO` settings panel in the bundled dashboard); the change applies live on the Pi and persists to `config.yaml`. No SSH, no restart.
 - **Flex auto-discovery** — leave `flex.host` empty in `config.yaml` and spe-remote listens for the SmartSDR UDP broadcast on port 4992; the radio's IP and model are picked up automatically. Static config still wins when set.
 - **Self-contained** — single process serves both WebSocket API and web UI (no Apache/Nginx needed)
 - **Multi-client** — multiple browsers/devices can monitor the amplifier simultaneously
@@ -232,13 +233,32 @@ This is the bundled dashboard. To also drive the amp from Node-RED on the same P
 
 ## Orchestrated TUNE and Band Sweep
 
-When `flex.enabled: true` is set in `config.yaml`, spe-remote opens a second connection — TCP to a **FlexRadio 6000-series** rig over the SmartSDR API — and exposes three additional WebSocket commands that any client (MacExpert, browser dashboard, Node-RED) can call:
+spe-remote can drive a transmit rig to key a clean carrier while the SPE's ATU sweeps. Set `radio.kind` in `config.yaml` to pick the backend — `flex` (FlexRadio over SmartSDR), `tci` (Expert Electronics SunSDR / ExpertSDR3 over TCI), or `none` — and it exposes these additional WebSocket commands that any client (MacExpert, browser dashboard, Node-RED) can call:
 
 | WS command | What it does |
 |---|---|
-| `tune_single` | Run one ATU tune cycle on the Flex's current slice freq. Sends SPE TUNE keycode, waits for the front-panel TUNE LED to come on (RCU byte 4 bit 6), tells the Flex to emit a 10 W carrier, waits for the LED to go off (ATU done), cuts the carrier. No blind timing. |
+| `radio_connect` | Open the rig connection. Sent when a client opens its Sweep menu, so the radio is ready by the time the operator hits Start. Idempotent. (`flex_connect` is a back-compat alias.) |
+| `radio_disconnect` | Close the rig connection. Sent when a client closes its Sweep menu while idle. Ignored while a tune cycle is running. (`flex_disconnect` alias.) |
+| `tune_single` | Run one ATU tune cycle on the rig's current freq. Sends SPE TUNE keycode, waits for the front-panel TUNE LED to come on (RCU byte 4 bit 6), keys the rig's tune carrier, waits for the LED to go off (ATU done), cuts the carrier. No blind timing. |
 | `tune_band:<band>` | Sweep the SPE manual's recommended in-band sub-band centers for `<band>` (`160m`, `80m`, `60m`, …, `6m`). Saves the operator's pre-sweep VFO freq + mode, hits each sub-band in turn, restores the VFO at the end. |
 | `tune_stop` | Abort an in-progress single tune or sweep. The carrier-off command runs in a `finally` block — a stopped cycle always drops the carrier before exiting. |
+| `get_config` / `set_radio_config:<json>` | Read / live-change the active radio + its settings from the client. See [Client-driven radio config](#client-driven-radio-config). |
+
+The tune **sequence is radio-agnostic** — only the per-rig commands differ:
+
+| Step | Flex (SmartSDR) | SunSDR (TCI) |
+|---|---|---|
+| Set freq | `slice t <s> <MHz>` | `vfo:<trx>,0,<Hz>;` |
+| Set mode | `slice s <s> mode=CWU` | `modulation:<trx>,CW;` |
+| Tune carrier | `transmit tune on/off` | `tune:<trx>,true/false;` |
+
+**On-demand connection (the radio is only held while tuning).** spe-remote does **not** open the rig session at startup. It connects when the operator opens the Sweep menu (`radio_connect`) and drops it again as soon as the tune cycle or band sweep finishes — so the radio isn't marked "in use" the rest of the time, and it can be powered off until you actually need it (host resolution is deferred too). As a safety net the server also connects lazily at the start of any `tune_single` / `tune_band`, so a client that never sends `radio_connect` still works. Connection transitions broadcast as `tune_event` phases `RADIO_CONNECTING` → `RADIO_CONNECTED` → `RADIO_DISCONNECTED` (or `RADIO_ERROR`).
+
+### Client-driven radio config
+
+The active rig and its settings live in `config.yaml` (`radio.kind` + a `flex:` and a `tci:` section), but a client doesn't need to touch the file or restart the service. Sending `get_config` returns the current radio config as `{"config_event":"radio","radio":{kind, flex:{…}, tci:{…}}}`; sending `set_radio_config:<json>` (e.g. `{"kind":"tci","tci":{"host":"127.0.0.1","port":50001}}`) switches/edits the rig **live** — spe-remote disconnects the old rig, rebuilds the backend, rewrites `config.yaml` (preserving comments), and broadcasts the new config. The bundled dashboard's **RADIO** button is a working example. Changes are refused while a tune is running. Full contract: [`docs/CLIENT_RADIO_CONFIG.md`](docs/CLIENT_RADIO_CONFIG.md).
+
+**SunSDR / TCI notes.** TCI is a WebSocket text protocol (default port 50001). `tci.trx` selects which receiver to key; tune power is left to ExpertSDR unless `tci.tune_drive` (percent) is set. Command set verified against the [sm5tog/sm5k-spe-tuner](https://github.com/sm5tog/sm5k-spe-tuner) reference.
 
 Phase progress streams back to every connected client as JSON broadcasts on the same WS:
 
@@ -266,7 +286,7 @@ Four UIs render the same broadcast stream as a sweep panel:
 | Node-RED `/ui` | `http://<pi>:1880/ui` SPE tab | SWEEP button on the SPE Panel; collapsible panel below |
 | Vue `/shack` | `http://<pi>/shack` SPE card | SWEEP in the 4-button controls grid; expandable panel inside the card |
 
-All four send `tune_band:<band>` / `tune_stop` over the same WS and consume the same `tune_event` JSON, so the Pi-side orchestrator is the single source of truth.
+All four send `tune_band:<band>` / `tune_stop` over the same WS and consume the same `tune_event` JSON, so the Pi-side orchestrator is the single source of truth. The bundled web dashboard also sends `flex_connect` / `flex_disconnect` as its Sweep panel opens and closes; the other clients can adopt those for a faster first tune, but don't have to — the server connects lazily at tune start regardless.
 
 ### Flex auto-discovery
 
@@ -607,6 +627,20 @@ Clients send bare command names as WebSocket text messages. The server dispatche
 | `set_temp_unit:C` / `:F` | Switch temperature display unit live; persisted to `config.yaml` |
 
 > **Alias:** `gain` is kept as an alias for `power_level` for backward compatibility with the original OH2GEK client.
+
+**Radio tune/sweep commands** (when `radio.kind` is `flex` or `tci` — see [Orchestrated TUNE and Band Sweep](#orchestrated-tune-and-band-sweep)):
+
+| Command | Action |
+|---|---|
+| `radio_connect` | Open the rig connection (on Sweep-menu open). Idempotent. (`flex_connect` alias.) |
+| `radio_disconnect` | Close it (on idle Sweep-menu close). Ignored mid-tune. (`flex_disconnect` alias.) |
+| `tune_single` | One ATU tune cycle at the rig's current freq |
+| `tune_band:<band>` | Sweep the manual's sub-bands for `<band>` (e.g. `tune_band:20m`) |
+| `tune_stop` | Abort an in-progress tune/sweep (always drops the carrier) |
+| `get_config` | Reply with the current radio config (`config_event:"radio"`) |
+| `set_radio_config:<json>` | Switch/edit the active radio live + persist (see [`docs/CLIENT_RADIO_CONFIG.md`](docs/CLIENT_RADIO_CONFIG.md)) |
+
+Progress streams back as `{"tune_event": <phase>, "tune_message": <text>, "ts": <t>}` — see the linked section for the full phase vocabulary, including the `RADIO_CONNECTING` / `RADIO_CONNECTED` / `RADIO_DISCONNECTED` connection-lifecycle phases.
 
 ### Example: JavaScript Client
 

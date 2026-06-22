@@ -52,11 +52,17 @@ def _fmt_qstr(v):
 SUPPORTED = {
     ("serial", "port"): _fmt_plain,
     ("server", "port"): _fmt_int,
+    ("radio", "kind"): _fmt_plain,
     ("flex", "enabled"): _fmt_bool,
     ("flex", "host"): _fmt_qstr,
     ("flex", "port"): _fmt_int,
     ("flex", "slice_rx"): _fmt_int,
     ("flex", "tune_power_watts"): _fmt_int,
+    ("tci", "host"): _fmt_qstr,
+    ("tci", "port"): _fmt_int,
+    ("tci", "trx"): _fmt_int,
+    ("tci", "mode"): _fmt_plain,
+    ("tci", "tune_drive"): _fmt_int,
 }
 
 FLEX_DEFAULTS = {

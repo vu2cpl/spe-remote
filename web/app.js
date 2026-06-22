@@ -14,6 +14,8 @@
     ws.onopen = () => {
       reconnectDelay = 1000;
       setConnected(true);
+      // Pull the current radio config so the settings panel reflects it.
+      ws.send("get_config");
     };
 
     ws.onclose = () => {
@@ -29,6 +31,8 @@
         const d = JSON.parse(evt.data);
         if (d.power_result) {
           handlePowerResult(d);
+        } else if (d.config_event === "radio") {
+          handleRadioConfig(d.radio);
         } else if (d.tune_event) {
           handleTuneEvent(d);
         } else if (d.heartbeat) {
@@ -378,11 +382,85 @@
       ws.readyState !== WebSocket.OPEN;
   }
 
+  // Radio connection is on-demand: opening the Sweep menu pre-warms it,
+  // closing it (while idle) drops it. The server also connects lazily at
+  // tune start and disconnects when the cycle is over, so this is purely
+  // a head-start, not a hard requirement.
+  function radioConnect() {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send("radio_connect");
+  }
+  function radioDisconnect() {
+    // Never drop the radio mid-sweep; the server ignores this while a
+    // cycle is running, but guard here too to avoid the needless message.
+    if (!isSweeping && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send("radio_disconnect");
+    }
+  }
+
+  // ---- Radio settings panel (client-selected radio) -----------------
+  // The server sends {config_event:"radio", radio:{kind, flex:{}, tci:{}}}
+  // on connect and after any change; we mirror it into the form. Applying
+  // sends set_radio_config:<json> which the server persists + applies live.
+  function val(id) { const el = document.getElementById(id); return el ? el.value : ""; }
+  function setVal(id, v) { const el = document.getElementById(id); if (el && v !== undefined && v !== null) el.value = v; }
+
+  function showRadioFields(kind) {
+    const flex = document.getElementById("flexFields");
+    const tci = document.getElementById("tciFields");
+    if (flex) flex.hidden = kind !== "flex";
+    if (tci) tci.hidden = kind !== "tci";
+  }
+
+  function handleRadioConfig(radio) {
+    if (!radio) return;
+    setVal("radioKind", radio.kind);
+    const f = radio.flex || {}, t = radio.tci || {};
+    setVal("flexHost", f.host); setVal("flexPort", f.port);
+    setVal("flexSlice", f.slice_rx); setVal("flexPower", f.tune_power_watts);
+    setVal("tciHost", t.host); setVal("tciPort", t.port);
+    setVal("tciTrx", t.trx); setVal("tciMode", t.mode); setVal("tciDrive", t.tune_drive);
+    showRadioFields(radio.kind);
+  }
+
+  window.onRadioKindChange = function () { showRadioFields(val("radioKind")); };
+
+  window.toggleRadioPanel = function () {
+    const panel = document.getElementById("radioPanel");
+    if (!panel) return;
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden && ws && ws.readyState === WebSocket.OPEN) ws.send("get_config");
+  };
+
+  window.applyRadioConfig = function () {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const kind = val("radioKind");
+    const payload = { kind };
+    if (kind === "flex") {
+      payload.flex = {
+        host: val("flexHost"), port: Number(val("flexPort")) || 4992,
+        slice_rx: Number(val("flexSlice")) || 0,
+        tune_power_watts: Number(val("flexPower")) || 10,
+      };
+    } else if (kind === "tci") {
+      payload.tci = {
+        host: val("tciHost"), port: Number(val("tciPort")) || 50001,
+        trx: Number(val("tciTrx")) || 0, mode: val("tciMode") || "CW",
+        tune_drive: Number(val("tciDrive")) || 0,
+      };
+    }
+    ws.send("set_radio_config:" + JSON.stringify(payload));
+  };
+
   window.toggleSweepPanel = function () {
     const panel = document.getElementById("sweepPanel");
     if (!panel) return;
     panel.hidden = !panel.hidden;
-    if (!panel.hidden) renderBandButtons();
+    if (!panel.hidden) {
+      renderBandButtons();
+      radioConnect();
+    } else {
+      radioDisconnect();
+    }
   };
 
   window.startSelectedSweep = function () {
@@ -435,6 +513,20 @@
   function handleTuneEvent(d) {
     const phase = d.tune_event;
     const message = d.tune_message || "";
+
+    // Radio connection-lifecycle events. Show pre-tune feedback
+    // (connecting / connected / error) but never flip sweeping state or
+    // clobber a finished sweep's terminal status with the housekeeping
+    // RADIO_DISCONNECTED that follows it. RADIO_CONFIG_UPDATED is handled
+    // via the config_event message, so ignore it here. (FLEX_ kept for
+    // tolerance with an older server.)
+    if (phase && (phase.indexOf("RADIO_") === 0 || phase.indexOf("FLEX_") === 0)) {
+      if (phase === "RADIO_CONFIG_UPDATED") return;
+      if (phase !== "RADIO_DISCONNECTED" && phase !== "FLEX_DISCONNECTED") {
+        setSweepUI({ phase, message });
+      }
+      return;
+    }
 
     if (phase === "STARTED" || phase === "SWEEP_STARTED") {
       isSweeping = true;

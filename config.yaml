@@ -32,17 +32,33 @@ amp:
   # and to scale the temperature gauge.
   temperature_unit: C    # C or F
 
-# Optional FlexRadio 6000-series control for orchestrated TUNE + band
-# sweep. Leave enabled: false to run spe-remote exactly as before.
-# When enabled, spe-remote opens a second connection (SmartSDR TCP API)
-# and exposes the tune_single / tune_band / tune_stop WS commands. See
-# README "Orchestrated TUNE and Band Sweep" for the full flow.
+# Which radio drives the orchestrated TUNE + band sweep:
+#   flex  → FlexRadio 6000 over SmartSDR (the `flex:` section below)
+#   tci   → ExpertSDR3 / SunSDR over TCI    (the `tci:` section below)
+#   none  → no rig; tune commands fail cleanly
+# A client (MacExpert / web dashboard) can change this and the per-radio
+# settings live over the WebSocket — see README "Client-driven radio config".
+radio:
+  kind: flex              # flex | tci | none
+
+# FlexRadio 6000-series control over the SmartSDR TCP API. Used when
+# radio.kind is flex. (enabled is kept in sync with radio.kind for
+# back-compat with configs written before the selector existed.)
 flex:
   enabled: true
   host: "192.168.1.148"   # Static LAN IP of the Flex; leave empty ("") to auto-discover via SmartSDR UDP broadcast on port 4992
   port: 4992              # SmartSDR TCP control port
   slice_rx: 0             # Which slice to drive during tune cycles
   tune_power_watts: 10    # Carrier power for ATU tunes; SPE wants 2-15 W
+
+# Expert Electronics SunSDR / ExpertSDR3 control over TCI. Used when
+# radio.kind is tci. TCI is a WebSocket text protocol (default port 50001).
+tci:
+  host: "127.0.0.1"       # ExpertSDR3 / SunSDR TCI host
+  port: 50001             # TCI WebSocket port
+  trx: 0                  # which TRX/receiver to key (0 or 1)
+  mode: CW                # mode set on the tuned TRX
+  tune_drive: 0           # tune-power percent; 0 = leave to ExpertSDR
 
 logging:
   level: INFO            # DEBUG, INFO, WARNING, ERROR

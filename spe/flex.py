@@ -29,6 +29,8 @@ import asyncio
 import logging
 from typing import Any, Callable, Optional
 
+from spe.radio import RadioConnection
+
 logger = logging.getLogger(__name__)
 
 FLEX_TCP_PORT = 4992
@@ -57,7 +59,7 @@ class FlexProtocolError(Exception):
     """Raised when the radio rejects a command (non-zero status code)."""
 
 
-class FlexConnection:
+class FlexConnection(RadioConnection):
     """Async client for one Flex 6000-series radio.
 
     Lifecycle:
@@ -148,6 +150,14 @@ class FlexConnection:
         except (FlexProtocolError, asyncio.TimeoutError, ConnectionError):
             logger.warning("Flex: could not subscribe to slice events; "
                            "slice_state will stay empty")
+
+    @property
+    def is_connected(self) -> bool:
+        """True while the TCP socket is open and the reader loop is live.
+
+        Used by :class:`spe.flex_controller.FlexController` to make
+        connect/disconnect idempotent in the on-demand lifecycle."""
+        return self._writer is not None and self._reader_task is not None
 
     async def close(self) -> None:
         """Shut down the connection. Idempotent."""
@@ -360,6 +370,52 @@ class FlexConnection:
         """Read-only: return the slice list as the radio reports it.
         Useful for confirming connectivity without keying anything."""
         return await self.send("slice list")
+
+    # ------------------------------------------------------------------
+    # RadioConnection interface (generic names the orchestrator uses)
+    # ------------------------------------------------------------------
+    #
+    # Thin adapters over the slice-oriented methods above so the tune
+    # orchestrator can drive a Flex and a SunSDR/TCI rig through one API.
+    # ``channel`` is the Flex slice index.
+
+    async def set_frequency(self, channel: int, freq_mhz: float) -> None:
+        await self.set_slice_freq(channel, freq_mhz)
+
+    async def set_mode(self, channel: int, mode: str) -> None:
+        # The orchestrator asks for a generic "CW"; on a Flex the clean
+        # tune carrier wants an actual CW sub-mode. Map CW→CWU; pass any
+        # other mode (e.g. a restored "USB"/"LSB") through verbatim.
+        flex_mode = "CWU" if mode.strip().upper() == "CW" else mode
+        await self.set_slice_mode(channel, flex_mode)
+
+    def snapshot(self, channel: int) -> Optional[dict]:
+        """Capture the slice's current freq+mode from the subscribed
+        ``slice_state`` cache (populated by ``sub slice all``). Returns
+        None when the cache hasn't been seen yet — the orchestrator then
+        skips restore."""
+        state = self.slice_state.get(channel)
+        if not state:
+            return None
+        freq = state.get("RF_frequency")
+        mode = state.get("mode")
+        if freq is None and mode is None:
+            return None
+        return {"channel": channel, "freq": freq, "mode": mode}
+
+    async def restore(self, snap: Optional[dict]) -> None:
+        if snap is None:
+            return
+        channel = snap["channel"]
+        freq = snap.get("freq")
+        mode = snap.get("mode")
+        try:
+            if freq is not None:
+                await self.set_slice_freq(channel, float(freq))
+            if mode is not None:
+                await self.set_slice_mode(channel, mode)
+        except Exception:
+            logger.exception("Flex: failed to restore slice freq+mode")
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -19,16 +19,24 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
     _serial_handler = None
     _power_controller = None
     _tune_orchestrator = None
+    _radio_controller = None
+    _app_config = None
+    _config_path = "config.yaml"
     _last_json = ""
     _last_broadcast_time = 0.0
     _heartbeat_interval = 15.0
 
     @classmethod
     def configure(cls, serial_handler, power_controller=None,
-                  tune_orchestrator=None, heartbeat: float = 15.0) -> None:
+                  tune_orchestrator=None, radio_controller=None,
+                  app_config=None, config_path="config.yaml",
+                  heartbeat: float = 15.0) -> None:
         cls._serial_handler = serial_handler
         cls._power_controller = power_controller
         cls._tune_orchestrator = tune_orchestrator
+        cls._radio_controller = radio_controller
+        cls._app_config = app_config
+        cls._config_path = config_path
         cls._heartbeat_interval = heartbeat
 
     def check_origin(self, origin) -> bool:
@@ -98,6 +106,44 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
             # cut before it returns. Sweep checks the stop event
             # before each sub-band so abort lands quickly.
             self._tune_orchestrator.stop()
+        elif message in ("radio_connect", "flex_connect"):
+            # Sent when a client opens its Sweep menu — pre-warm the radio
+            # connection so it's ready when the operator hits Start.
+            # Idempotent; RadioController broadcasts RADIO_CONNECTING /
+            # RADIO_CONNECTED / RADIO_ERROR so the UI can reflect status.
+            # No-op when no radio is configured — handled here (not
+            # forwarded to the serial handler as an amp command).
+            # `flex_connect` is kept as an alias for older clients.
+            if self._radio_controller:
+                import tornado.ioloop
+                tornado.ioloop.IOLoop.current().spawn_callback(
+                    self._radio_controller.connect
+                )
+        elif message in ("radio_disconnect", "flex_disconnect"):
+            # Sent when a client closes its Sweep menu while idle. Don't
+            # drop the radio mid-tune — the orchestrator owns the
+            # connection for the duration of a cycle and disconnects
+            # itself when the cycle is over.
+            if self._radio_controller and not (
+                self._tune_orchestrator and self._tune_orchestrator.is_running
+            ):
+                import tornado.ioloop
+                tornado.ioloop.IOLoop.current().spawn_callback(
+                    self._radio_controller.disconnect
+                )
+        elif message == "get_config":
+            # Reply (to this client only) with the current radio config so
+            # the client can render its radio picker / settings form.
+            self._send_radio_config()
+        elif message.startswith("set_radio_config:") and self._radio_controller:
+            # Client-driven radio selection / settings edit. Payload is
+            # JSON, e.g. {"kind":"tci","tci":{"host":"127.0.0.1","port":50001}}.
+            # Applies live (no restart) and persists to config.yaml.
+            import tornado.ioloop
+            payload = message.split(":", 1)[1]
+            tornado.ioloop.IOLoop.current().spawn_callback(
+                self._handle_set_radio_config, payload
+            )
         elif message.startswith("set_temp_unit:") and self._serial_handler:
             # Live temperature-unit toggle. Example payloads: "set_temp_unit:F"
             # or "set_temp_unit:C". Updates in-memory unit on the handler
@@ -109,6 +155,94 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
             persist_temperature_unit(applied)
         elif self._serial_handler:
             self._serial_handler.send_command(message)
+
+    # ------------------------------------------------------------------
+    # Radio configuration (client-selected radio)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _radio_config_payload(cls) -> str:
+        """Serialise the current radio config for a client picker/form."""
+        cfg = cls._app_config
+        flex = cfg.flex if cfg else None
+        tci = cfg.tci if cfg else None
+        kind = cfg.radio.kind if cfg else "none"
+        return json.dumps({
+            "config_event": "radio",
+            "radio": {
+                "kind": kind,
+                "flex": {
+                    "host": flex.host, "port": flex.port,
+                    "slice_rx": flex.slice_rx,
+                    "tune_power_watts": flex.tune_power_watts,
+                } if flex else {},
+                "tci": {
+                    "host": tci.host, "port": tci.port, "trx": tci.trx,
+                    "mode": tci.mode, "tune_drive": tci.tune_drive,
+                } if tci else {},
+            },
+        })
+
+    def _send_radio_config(self) -> None:
+        """Send the current radio config to this client only."""
+        try:
+            self.write_message(self._radio_config_payload())
+        except tornado.websocket.WebSocketClosedError:
+            pass
+
+    async def _handle_set_radio_config(self, payload: str) -> None:
+        """Apply a client's radio-config change live, persist it, and
+        broadcast the new config to every client. Payload is JSON:
+        ``{"kind": "...", "flex": {...}, "tci": {...}}`` (sections
+        optional). Refused while a tune cycle is running."""
+        from spe.config import persist_values
+
+        cfg = self._app_config
+        if cfg is None:
+            return
+        if self._tune_orchestrator and self._tune_orchestrator.is_running:
+            AmplifierWebSocket.broadcast_tune_event(
+                "RADIO_ERROR", "cannot change radio while a tune is running")
+            return
+        try:
+            data = json.loads(payload)
+        except (ValueError, TypeError) as e:
+            AmplifierWebSocket.broadcast_tune_event(
+                "RADIO_ERROR", f"bad set_radio_config payload: {e}")
+            return
+
+        changes: dict = {}
+        kind = str(data.get("kind", cfg.radio.kind)).strip().lower()
+        if kind not in ("flex", "tci", "none"):
+            AmplifierWebSocket.broadcast_tune_event(
+                "RADIO_ERROR", f"unknown radio kind {kind!r}")
+            return
+        cfg.radio.kind = kind
+        changes["radio.kind"] = kind
+        # Keep flex.enabled consistent with the selector for back-compat.
+        cfg.flex.enabled = (kind == "flex")
+        changes["flex.enabled"] = cfg.flex.enabled
+
+        # Apply only the fields the client sent for each section.
+        for field in ("host", "port", "slice_rx", "tune_power_watts"):
+            if "flex" in data and field in data["flex"]:
+                setattr(cfg.flex, field, data["flex"][field])
+                changes[f"flex.{field}"] = data["flex"][field]
+        for field in ("host", "port", "trx", "mode", "tune_drive"):
+            if "tci" in data and field in data["tci"]:
+                setattr(cfg.tci, field, data["tci"][field])
+                changes[f"tci.{field}"] = data["tci"][field]
+
+        # Drop any open connection, then swap the controller's backend.
+        await self._radio_controller.disconnect()
+        self._radio_controller.reconfigure(cfg.radio, cfg.flex, cfg.tci)
+
+        persist_values(changes, self._config_path)
+        logger.info("Radio config changed live: kind=%s", kind)
+
+        AmplifierWebSocket.broadcast_raw(self._radio_config_payload())
+        AmplifierWebSocket.broadcast_tune_event(
+            "RADIO_CONFIG_UPDATED", f"radio set to {kind}")
 
     async def _handle_power(self, command: str) -> None:
         """Handle power on/off commands asynchronously."""
