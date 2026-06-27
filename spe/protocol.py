@@ -125,6 +125,28 @@ class AmplifierState:
     tx_antenna: str = "0"
     p_level: str = "0"
     p_out: str = "0"
+    # Exponentially-smoothed version of p_out, in watts (float, not the raw
+    # amp string). Added alongside p_out rather than replacing it so every
+    # existing consumer (web/app.js, Node-RED's WS state -> Dashboard
+    # payload, MacExpert) keeps seeing the raw instantaneous reading
+    # unless it explicitly switches to this field. See
+    # SerialHandler._consume_csv_frame for how it's computed.
+    p_out_avg: float = 0.0
+    # Peak-hold version of p_out, in watts. Tracks the single highest
+    # sample seen in roughly the last _pout_peak_hold_s, then decays back
+    # toward the live reading at a constant W/s once that window elapses
+    # (a transceiver-style "PEP hold" meter, not a sample-and-decay
+    # flicker).
+    #
+    # Important accuracy note: this is a SAMPLED approximation, not true
+    # envelope-peak detection. The amp is polled at 25 Hz during TX
+    # (tx_interval in config.yaml) — a 40ms gap between samples — so any
+    # true RF envelope peak narrower than that gap can be missed entirely.
+    # This will catch sustained voice/CW peaks a human operator cares
+    # about; it will NOT match what a fast analog peak-reading wattmeter
+    # or the amp's own internal ADC (if any) would show for short spikes.
+    # See SerialHandler._consume_csv_frame for the hold/decay logic.
+    p_out_peak: float = 0.0
     swr: str = "0"
     aswr: str = "0"
     voltage: str = "0"

@@ -151,6 +151,46 @@ class SerialHandler:
         # corruption signature) show up in journald without DEBUG noise.
         # Diagnostic-only; no behaviour change.
         self._prev_op_status: str = ""
+
+        # --- p_out averaging (EMA) -----------------------------------
+        # Smoothing factor: higher = faster response / less smoothing.
+        # 0.15 settles roughly over ~1s at the 25 Hz TX poll rate
+        # (tx_interval=0.04s in config.yaml), which is in the same
+        # ballpark as a typical "AVG" meter ballistic on a transceiver.
+        # Tune by feel if it reads too twitchy or too sluggish.
+        self._pout_avg_alpha: float = 0.15
+        self._pout_avg: float | None = None
+        # Tracks the (op_status, tx_status) pair the average was last
+        # computed for. On any change — most importantly RX -> TX at the
+        # start of a transmission — we reset rather than smooth, so the
+        # first few samples of a new transmission aren't dragged down by
+        # whatever idle/zero reading preceded it.
+        self._pout_avg_key: tuple[str, str] | None = None
+
+        # --- p_out peak-hold ------------------------------------------
+        # How long the held peak stays pinned before it starts decaying
+        # back toward the live reading. 2.5s matches the de-facto PEP
+        # hold convention on most modern transceivers.
+        self._pout_peak_hold_s: float = 2.5
+        # Once the hold window expires, how fast the displayed peak falls
+        # back toward the current reading, in watts per second. Purely
+        # cosmetic (stops the number "snapping" downward, which reads as
+        # jumpy in exactly the way this feature exists to avoid). A full
+        # 1500W -> 0W fall takes ~2.5s. The fall is scaled by real elapsed
+        # time between frames, so the rate is independent of the sample
+        # rate (see _consume_csv_frame).
+        self._pout_peak_decay_w_per_s: float = 600.0
+        self._pout_peak: float = 0.0
+        # Monotonic timestamp the hold window is measured from (set when
+        # _pout_peak was last pinned: a new high, or a reset transition).
+        self._pout_peak_at: float = 0.0
+        # Monotonic timestamp of the previous frame — the decay step
+        # multiplies the W/s rate by (now - this) so the fall is a true
+        # constant W/s regardless of how fast frames arrive.
+        self._pout_peak_prev_tick: float = 0.0
+        # Same reset-on-transition rule as the average — see
+        # _pout_avg_key above for why.
+        self._pout_peak_key: tuple[str, str] | None = None
         # TUNE LED state from the latest RCU frame's byte 4 bit 6.
         # False until at least one RCU frame has arrived; thereafter
         # mirrors the front-panel LED with at most _RCU_TICK_INTERVAL
@@ -591,6 +631,52 @@ class SerialHandler:
                         f"(tx={state.tx_status}) raw={line!r}"
                     )
                     self._prev_op_status = state.op_status
+
+                # p_out averaging. Reset (don't smooth) across an op/tx
+                # transition — e.g. RX -> TX at the start of a transmission
+                # — so the average doesn't start a new TX dragged down by
+                # whatever was reading during idle/standby.
+                pout_key = (state.op_status, state.tx_status)
+                try:
+                    pout_raw = float(state.p_out)
+                except (TypeError, ValueError):
+                    pout_raw = 0.0
+                if self._pout_avg is None or pout_key != self._pout_avg_key:
+                    self._pout_avg = pout_raw
+                else:
+                    a = self._pout_avg_alpha
+                    self._pout_avg = a * pout_raw + (1 - a) * self._pout_avg
+                self._pout_avg_key = pout_key
+                state.p_out_avg = round(self._pout_avg, 1)
+
+                # p_out peak-hold. Reset on the same op/tx transitions as
+                # the average, for the same reason — a fresh TX shouldn't
+                # start by holding whatever the amp last read during idle.
+                now = time.monotonic()
+                if pout_key != self._pout_peak_key:
+                    # New TX/RX context — start the hold fresh at the live
+                    # reading.
+                    self._pout_peak = pout_raw
+                    self._pout_peak_at = now
+                elif pout_raw >= self._pout_peak:
+                    # New high sample — pin it and restart the hold timer.
+                    self._pout_peak = pout_raw
+                    self._pout_peak_at = now
+                elif (now - self._pout_peak_at) > self._pout_peak_hold_s:
+                    # Hold window elapsed — decay toward the live reading at
+                    # a constant W/s, scaled by real elapsed time since the
+                    # previous frame so the rate is independent of the
+                    # sample rate. The max() floor stops it dropping below
+                    # the live reading.
+                    dt = now - self._pout_peak_prev_tick
+                    self._pout_peak = max(
+                        pout_raw,
+                        self._pout_peak - self._pout_peak_decay_w_per_s * dt,
+                    )
+                self._pout_peak_prev_tick = now
+                self._pout_peak_key = pout_key
+                state.p_out_peak = round(self._pout_peak, 1)
+
                 self._state = state
                 self._last_state_at = time.monotonic()
                 self.on_state_update(state)

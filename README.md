@@ -540,6 +540,8 @@ The socket carries **three** kinds of server-to-client messages: JSON state upda
   "tx_antenna": "1",
   "p_level": "H",
   "p_out": "1353",
+  "p_out_avg": 742.0,
+  "p_out_peak": 1353.0,
   "swr": "1.54",
   "aswr": "1.12",
   "voltage": "54.6",
@@ -554,6 +556,8 @@ The socket carries **three** kinds of server-to-client messages: JSON state upda
 ```
 
 `model` is the amp's own ID code: `"13K"` (Expert 1.3K-FA), `"15K"` (1.5K-FA), or `"20K"` (2K-FA). The web client uses it to set the page header, scale the power bar (1500 W vs 2000 W), and show the lower-heatsink + combiner temps that only the 2K-FA reports. Empty string = unknown/not yet received.
+
+`p_out_avg` and `p_out_peak` are server-side derivations of `p_out` (floats, watts), added so clients can offer RAW / AVG / PEAK meter modes without each re-implementing the ballistics. `p_out_avg` is an EMA (α=0.15, ~1 s settle at the 25 Hz TX poll); `p_out_peak` is a peak-hold that pins the highest sample for ~2.5 s then decays back toward the live reading at a constant 600 W/s. Both reset (no smoothing/hold carried over) across an op/tx transition so a fresh transmission isn't dragged by the prior idle reading. **`p_out_peak` is a *sampled* peak, not true envelope PEP** — at 25 Hz any RF peak narrower than ~40 ms can be missed; it catches sustained voice/CW crests, not short spikes. Raw `p_out` is untouched, so existing consumers are unaffected.
 
 **2. Power action result (text JSON, sent after `power_on` / `power_off`):**
 
