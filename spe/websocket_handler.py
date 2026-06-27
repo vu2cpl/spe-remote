@@ -19,16 +19,19 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
     _serial_handler = None
     _power_controller = None
     _tune_orchestrator = None
+    _flex_controller = None
     _last_json = ""
     _last_broadcast_time = 0.0
     _heartbeat_interval = 15.0
 
     @classmethod
     def configure(cls, serial_handler, power_controller=None,
-                  tune_orchestrator=None, heartbeat: float = 15.0) -> None:
+                  tune_orchestrator=None, flex_controller=None,
+                  heartbeat: float = 15.0) -> None:
         cls._serial_handler = serial_handler
         cls._power_controller = power_controller
         cls._tune_orchestrator = tune_orchestrator
+        cls._flex_controller = flex_controller
         cls._heartbeat_interval = heartbeat
 
     def check_origin(self, origin) -> bool:
@@ -98,6 +101,30 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
             # cut before it returns. Sweep checks the stop event
             # before each sub-band so abort lands quickly.
             self._tune_orchestrator.stop()
+        elif message == "flex_connect":
+            # Sent when a client opens its Sweep menu — pre-warm the
+            # Flex connection so it's ready when the operator hits Start.
+            # Idempotent; FlexController broadcasts FLEX_CONNECTING /
+            # FLEX_CONNECTED / FLEX_ERROR so the UI can reflect status.
+            # No-op when Flex is disabled — handled here (not forwarded
+            # to the serial handler as an amp command).
+            if self._flex_controller:
+                import tornado.ioloop
+                tornado.ioloop.IOLoop.current().spawn_callback(
+                    self._flex_controller.connect
+                )
+        elif message == "flex_disconnect":
+            # Sent when a client closes its Sweep menu while idle. Don't
+            # drop the radio mid-tune — the orchestrator owns the
+            # connection for the duration of a cycle and disconnects
+            # itself when the cycle is over.
+            if self._flex_controller and not (
+                self._tune_orchestrator and self._tune_orchestrator.is_running
+            ):
+                import tornado.ioloop
+                tornado.ioloop.IOLoop.current().spawn_callback(
+                    self._flex_controller.disconnect
+                )
         elif message.startswith("set_temp_unit:") and self._serial_handler:
             # Live temperature-unit toggle. Example payloads: "set_temp_unit:F"
             # or "set_temp_unit:C". Updates in-memory unit on the handler

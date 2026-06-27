@@ -378,11 +378,31 @@
       ws.readyState !== WebSocket.OPEN;
   }
 
+  // Flex connection is on-demand: opening the Sweep menu pre-warms it,
+  // closing it (while idle) drops it. The server also connects lazily at
+  // tune start and disconnects when the cycle is over, so this is purely
+  // a head-start, not a hard requirement.
+  function flexConnect() {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send("flex_connect");
+  }
+  function flexDisconnect() {
+    // Never drop the radio mid-sweep; the server ignores this while a
+    // cycle is running, but guard here too to avoid the needless message.
+    if (!isSweeping && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send("flex_disconnect");
+    }
+  }
+
   window.toggleSweepPanel = function () {
     const panel = document.getElementById("sweepPanel");
     if (!panel) return;
     panel.hidden = !panel.hidden;
-    if (!panel.hidden) renderBandButtons();
+    if (!panel.hidden) {
+      renderBandButtons();
+      flexConnect();
+    } else {
+      flexDisconnect();
+    }
   };
 
   window.startSelectedSweep = function () {
@@ -435,6 +455,15 @@
   function handleTuneEvent(d) {
     const phase = d.tune_event;
     const message = d.tune_message || "";
+
+    // Flex connection-lifecycle events. Show pre-tune feedback
+    // (connecting / connected / error) but never flip sweeping state or
+    // clobber a finished sweep's terminal status with the housekeeping
+    // FLEX_DISCONNECTED that follows it.
+    if (phase && phase.indexOf("FLEX_") === 0) {
+      if (phase !== "FLEX_DISCONNECTED") setSweepUI({ phase, message });
+      return;
+    }
 
     if (phase === "STARTED" || phase === "SWEEP_STARTED") {
       isSweeping = true;

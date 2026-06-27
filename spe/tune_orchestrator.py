@@ -36,6 +36,7 @@ from typing import Callable, Optional
 
 from spe.config import FlexConfig
 from spe.flex import FlexConnection, FlexProtocolError
+from spe.flex_controller import FlexController
 from spe.serial_handler import SerialHandler
 from spe.spe_band_table import BAND_TABLE, lookup as lookup_band
 
@@ -81,6 +82,14 @@ PHASES = (
     "SWEEP_STARTED",   # band sweep accepted; first sub-band about to start
     "SWEEP_STEP",      # next sub-band's tune cycle is about to begin
     "SWEEP_DONE",      # terminal: all sub-bands tuned cleanly
+    # Flex connection-lifecycle phases — emitted by FlexController on the
+    # same channel as the connection is opened on Sweep-menu open / tune
+    # start and closed when the cycle is over. Listed here so clients have
+    # the full phase vocabulary in one place.
+    "FLEX_CONNECTING",
+    "FLEX_CONNECTED",
+    "FLEX_DISCONNECTED",
+    "FLEX_ERROR",
 )
 
 
@@ -98,17 +107,31 @@ class TuneOrchestrator:
     def __init__(
         self,
         serial_handler: SerialHandler,
-        flex: FlexConnection,
+        flex_controller: FlexController,
         config: FlexConfig,
         on_status: Optional[StatusCallback] = None,
     ):
         self.serial = serial_handler
-        self.flex = flex
+        # The connection is opened on demand via the controller (see
+        # _acquire_flex / _release_flex), not held for the server's life.
+        self.flex_controller = flex_controller
         self.config = config
         self.on_status = on_status
 
         self._running = False
         self._stop_requested = asyncio.Event()
+
+    async def _acquire_flex(self) -> Optional[FlexConnection]:
+        """Open (or reuse) the Flex connection for a tune cycle.
+
+        Returns the live connection, or None if it couldn't be
+        established — in which case FlexController has already emitted a
+        FLEX_ERROR status, and the caller should emit FAIL and bail."""
+        return await self.flex_controller.connect()
+
+    async def _release_flex(self) -> None:
+        """Drop the Flex connection now the cycle is over. Best effort."""
+        await self.flex_controller.disconnect()
 
     def _status(self, phase: str, message: str = "") -> None:
         """Emit a phase transition. Internal logging at INFO; the
@@ -136,12 +159,21 @@ class TuneOrchestrator:
 
         self._running = True
         self._stop_requested.clear()
-        snap = self._snapshot_slice() if freq_mhz is not None else None
         try:
-            return await self._run_one_cycle(freq_mhz)
+            flex = await self._acquire_flex()
+            if flex is None:
+                self._status("FAIL", "Flex radio not reachable")
+                return False
+            snap = self._snapshot_slice(flex) if freq_mhz is not None else None
+            try:
+                return await self._run_one_cycle(flex, freq_mhz)
+            finally:
+                if snap is not None:
+                    await self._restore_slice(flex, snap)
         finally:
-            if snap is not None:
-                await self._restore_slice(snap)
+            # Disconnect once the cycle is over, per the on-demand
+            # lifecycle — the radio is only held while actually tuning.
+            await self._release_flex()
             self._running = False
 
     async def tune_band(self, band: str) -> bool:
@@ -173,8 +205,14 @@ class TuneOrchestrator:
 
         self._running = True
         self._stop_requested.clear()
-        snap = self._snapshot_slice()
+        flex = None
+        snap = None
         try:
+            flex = await self._acquire_flex()
+            if flex is None:
+                self._status("FAIL", "Flex radio not reachable")
+                return False
+            snap = self._snapshot_slice(flex)
             total = len(centers_khz)
             skipped = raw_total - total
             note = (f" ({skipped} out-of-band entries from the manual skipped)"
@@ -197,7 +235,7 @@ class TuneOrchestrator:
                 self._status("SWEEP_STEP",
                              f"{i}/{total}: {freq_mhz:.4f} MHz")
 
-                ok = await self._run_one_cycle(freq_mhz)
+                ok = await self._run_one_cycle(flex, freq_mhz)
                 if not ok:
                     # _run_one_cycle has already emitted FAIL with the
                     # specific reason — surface a sweep-level summary
@@ -221,10 +259,14 @@ class TuneOrchestrator:
             # Restore the operator's pre-sweep VFO + mode before we
             # release _running. Best effort — log on failure but don't
             # mask whatever terminal phase the sweep produced.
-            await self._restore_slice(snap)
+            if flex is not None and snap is not None:
+                await self._restore_slice(flex, snap)
+            # Disconnect now the sweep is over (on-demand lifecycle).
+            await self._release_flex()
             self._running = False
 
-    async def _run_one_cycle(self, freq_mhz: Optional[float]) -> bool:
+    async def _run_one_cycle(self, flex: FlexConnection,
+                             freq_mhz: Optional[float]) -> bool:
         """Single ATU tune cycle. Used by both tune_single (one call)
         and tune_band (called N times in a loop). Caller is responsible
         for setting / clearing self._running around this method.
@@ -255,7 +297,7 @@ class TuneOrchestrator:
             # ----- Optional freq + power setup ----------------------
             if freq_mhz is not None:
                 try:
-                    await self.flex.set_slice_freq(self.config.slice_rx, freq_mhz)
+                    await flex.set_slice_freq(self.config.slice_rx, freq_mhz)
                 except FlexProtocolError as e:
                     self._status("FAIL", f"set_slice_freq: {e}")
                     return False
@@ -263,7 +305,7 @@ class TuneOrchestrator:
                              f"{freq_mhz:.6f} MHz")
 
             try:
-                await self.flex.set_tune_power(self.config.tune_power_watts)
+                await flex.set_tune_power(self.config.tune_power_watts)
             except FlexProtocolError as e:
                 self._status("FAIL", f"set_tune_power: {e}")
                 return False
@@ -282,7 +324,7 @@ class TuneOrchestrator:
 
             # ----- Carrier on, wait for ATU done --------------------
             try:
-                await self.flex.tune_carrier(on=True)
+                await flex.tune_carrier(on=True)
             except FlexProtocolError as e:
                 self._status("FAIL", f"tune_carrier(on): {e}")
                 return False
@@ -316,7 +358,7 @@ class TuneOrchestrator:
             # eventually if all else fails.
             if carrier_on:
                 try:
-                    await self.flex.tune_carrier(on=False)
+                    await flex.tune_carrier(on=False)
                     self._status("CARRIER_OFF")
                 except Exception:
                     logger.exception("Failed to stop carrier in cleanup")
@@ -325,7 +367,7 @@ class TuneOrchestrator:
             self._status("SUCCESS" if success else "FAIL",
                          "cycle complete" if success else "see prior status")
 
-    def _snapshot_slice(self) -> Optional[dict]:
+    def _snapshot_slice(self, flex: FlexConnection) -> Optional[dict]:
         """Read the current freq+mode of the operator's slice from
         FlexConnection.slice_state. Returns a small dict the
         orchestrator can hand to ``_restore_slice`` later, or None if
@@ -333,7 +375,7 @@ class TuneOrchestrator:
         slice event since spe-remote connected). Emits ``VFO_SAVED`` on
         success."""
         rx = self.config.slice_rx
-        state = self.flex.slice_state.get(rx)
+        state = flex.slice_state.get(rx)
         if not state:
             self._status("VFO_SAVED",
                          f"slice {rx} state unknown — restore disabled")
@@ -348,7 +390,8 @@ class TuneOrchestrator:
                      f"slice {rx}: {freq} MHz {mode}")
         return {"rx": rx, "freq": freq, "mode": mode}
 
-    async def _restore_slice(self, snap: Optional[dict]) -> None:
+    async def _restore_slice(self, flex: FlexConnection,
+                             snap: Optional[dict]) -> None:
         """Write the saved freq+mode back to the Flex slice. Best
         effort — any failure logs at WARN and a FAIL status is emitted,
         but we never re-raise (the cycle that called us already has
@@ -360,9 +403,9 @@ class TuneOrchestrator:
         mode = snap["mode"]
         try:
             if freq is not None:
-                await self.flex.set_slice_freq(rx, float(freq))
+                await flex.set_slice_freq(rx, float(freq))
             if mode is not None:
-                await self.flex.set_slice_mode(rx, mode)
+                await flex.set_slice_mode(rx, mode)
             self._status("VFO_RESTORED",
                          f"slice {rx}: {freq} MHz {mode}")
         except Exception as e:

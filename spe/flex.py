@@ -149,6 +149,14 @@ class FlexConnection:
             logger.warning("Flex: could not subscribe to slice events; "
                            "slice_state will stay empty")
 
+    @property
+    def is_connected(self) -> bool:
+        """True while the TCP socket is open and the reader loop is live.
+
+        Used by :class:`spe.flex_controller.FlexController` to make
+        connect/disconnect idempotent in the on-demand lifecycle."""
+        return self._writer is not None and self._reader_task is not None
+
     async def close(self) -> None:
         """Shut down the connection. Idempotent."""
         if self._reader_task is not None:

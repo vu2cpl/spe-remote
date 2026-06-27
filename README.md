@@ -232,13 +232,17 @@ This is the bundled dashboard. To also drive the amp from Node-RED on the same P
 
 ## Orchestrated TUNE and Band Sweep
 
-When `flex.enabled: true` is set in `config.yaml`, spe-remote opens a second connection — TCP to a **FlexRadio 6000-series** rig over the SmartSDR API — and exposes three additional WebSocket commands that any client (MacExpert, browser dashboard, Node-RED) can call:
+When `flex.enabled: true` is set in `config.yaml`, spe-remote can open a second connection — TCP to a **FlexRadio 6000-series** rig over the SmartSDR API — and exposes these additional WebSocket commands that any client (MacExpert, browser dashboard, Node-RED) can call:
 
 | WS command | What it does |
 |---|---|
+| `flex_connect` | Open the SmartSDR connection. Sent when a client opens its Sweep menu, so the radio is ready by the time the operator hits Start. Idempotent. |
+| `flex_disconnect` | Close the SmartSDR connection. Sent when a client closes its Sweep menu while idle. Ignored while a tune cycle is running. |
 | `tune_single` | Run one ATU tune cycle on the Flex's current slice freq. Sends SPE TUNE keycode, waits for the front-panel TUNE LED to come on (RCU byte 4 bit 6), tells the Flex to emit a 10 W carrier, waits for the LED to go off (ATU done), cuts the carrier. No blind timing. |
 | `tune_band:<band>` | Sweep the SPE manual's recommended in-band sub-band centers for `<band>` (`160m`, `80m`, `60m`, …, `6m`). Saves the operator's pre-sweep VFO freq + mode, hits each sub-band in turn, restores the VFO at the end. |
 | `tune_stop` | Abort an in-progress single tune or sweep. The carrier-off command runs in a `finally` block — a stopped cycle always drops the carrier before exiting. |
+
+**On-demand connection (the radio is only held while tuning).** spe-remote does **not** open the SmartSDR session at startup. The connection is established when the operator opens the Sweep menu (`flex_connect`) and is dropped again as soon as the tune cycle or band sweep finishes — so the radio isn't marked "in use" by spe-remote the rest of the time, and it can be powered off until you actually need it (host discovery is deferred too). As a safety net the server also connects lazily at the start of any `tune_single` / `tune_band`, so a client that never sends `flex_connect` still works. Connection transitions broadcast as `tune_event` phases `FLEX_CONNECTING` → `FLEX_CONNECTED` → `FLEX_DISCONNECTED` (or `FLEX_ERROR`).
 
 Phase progress streams back to every connected client as JSON broadcasts on the same WS:
 
@@ -266,7 +270,7 @@ Four UIs render the same broadcast stream as a sweep panel:
 | Node-RED `/ui` | `http://<pi>:1880/ui` SPE tab | SWEEP button on the SPE Panel; collapsible panel below |
 | Vue `/shack` | `http://<pi>/shack` SPE card | SWEEP in the 4-button controls grid; expandable panel inside the card |
 
-All four send `tune_band:<band>` / `tune_stop` over the same WS and consume the same `tune_event` JSON, so the Pi-side orchestrator is the single source of truth.
+All four send `tune_band:<band>` / `tune_stop` over the same WS and consume the same `tune_event` JSON, so the Pi-side orchestrator is the single source of truth. The bundled web dashboard also sends `flex_connect` / `flex_disconnect` as its Sweep panel opens and closes; the other clients can adopt those for a faster first tune, but don't have to — the server connects lazily at tune start regardless.
 
 ### Flex auto-discovery
 
@@ -611,6 +615,18 @@ Clients send bare command names as WebSocket text messages. The server dispatche
 | `set_temp_unit:C` / `:F` | Switch temperature display unit live; persisted to `config.yaml` |
 
 > **Alias:** `gain` is kept as an alias for `power_level` for backward compatibility with the original OH2GEK client.
+
+**Flex tune/sweep commands** (only when `flex.enabled: true` — see [Orchestrated TUNE and Band Sweep](#orchestrated-tune-and-band-sweep)):
+
+| Command | Action |
+|---|---|
+| `flex_connect` | Open the SmartSDR connection (on Sweep-menu open). Idempotent. |
+| `flex_disconnect` | Close it (on idle Sweep-menu close). Ignored mid-tune. |
+| `tune_single` | One ATU tune cycle at the slice's current freq |
+| `tune_band:<band>` | Sweep the manual's sub-bands for `<band>` (e.g. `tune_band:20m`) |
+| `tune_stop` | Abort an in-progress tune/sweep (always drops the carrier) |
+
+Progress streams back as `{"tune_event": <phase>, "tune_message": <text>, "ts": <t>}` — see the linked section for the full phase vocabulary, including the `FLEX_CONNECTING` / `FLEX_CONNECTED` / `FLEX_DISCONNECTED` connection-lifecycle phases.
 
 ### Example: JavaScript Client
 
