@@ -120,6 +120,7 @@ systemd unit `spe-remote.service` runs the server as a daemon. `install-service.
 - No formal test suite. Everything has been tested against a live amp.
 - Auth on the WebSocket — currently open on the LAN, fine for a shack network, would need a token for anything exposed.
 - The dashboard's gauge rendering is canvas-based and hand-rolled; could move to a library but the current code is small and works on mobile.
+- **ser2net-compatible TCP shim for AetherSDR (deferred — try Option 1 first).** AetherSDR v26.8.2 (`#4531`) added SPE support via direct serial or ser2net TCP + RFC 2217 for the DTR power-ON pulse. It won't talk to our WebSocket. Two blockers if we add a compatibility shim: (1) both sides want to be the poller and SPE replies aren't tagged, so interleaved 100 ms polls will scramble — fan out the raw bytes we're already polling instead of accepting a second poller; (2) writes need a mutex around the shared `SerialHandler`, and the RFC 2217 COM-PORT-CONTROL subset AetherSDR uses has to tie into `PowerController`'s DTR sequence. Only worth building if the ser2net-only trial (stop `spe-remote.service`, run `ser2net` on the FTDI, point AetherSDR at it) proves AetherSDR's SPE support is worth daily use.
 
 ## Where to pick up
 
