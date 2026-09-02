@@ -31,10 +31,13 @@ Design notes:
     op_status) and hand OPERATE back at the end iff it was on at the
     start. The per-cycle preflight still hard-checks STBY as a safety
     net against mid-sweep front-panel flips.
-  * Trust but verify the band: tune_band maps the radio's slice freq
-    to its ham band and refuses a sweep on a different band than the
-    radio is on (wrong-antenna protection). Antenna selection itself
-    stays with the operator — spe-remote never touches it.
+  * The radio rules the band: tune_band maps the radio's slice freq
+    to its ham band and sweeps THAT band — a menu pick for a
+    different band is overridden with a note, never refused
+    (operator's call: the antenna follows the radio, so the radio's
+    band is always the safe one to tune). The explicit pick is only
+    used when the radio's band can't be read. Antenna selection
+    itself stays with the operator — spe-remote never touches it.
 """
 
 from __future__ import annotations
@@ -103,8 +106,9 @@ PHASES = (
     "ABORT",           # terminal: external stop() while running
     # Band-sweep phases — emitted in addition to the per-cycle phases
     # above when tune_band() is running.
-    "BAND_CHECKED",    # requested sweep band verified against (or derived
-                       # from) the radio's current slice frequency
+    "BAND_CHECKED",    # sweep band resolved from the radio's slice freq
+                       # (radio rules; the explicit pick is used only when
+                       # the radio's band can't be read)
     "SWEEP_STARTED",   # band sweep accepted; first sub-band about to start
     "SWEEP_STEP",      # next sub-band's tune cycle is about to begin
     "SWEEP_DONE",      # terminal: all sub-bands tuned cleanly
@@ -223,13 +227,13 @@ class TuneOrchestrator:
         for ``band`` (e.g. "20m", "40m"). For each sub-band, sets the
         Flex slice freq + runs a full tune cycle.
 
-        The requested band is verified against the radio before
-        anything moves: the operator slice's freq is mapped to its ham
-        band, and a mismatch FAILs the sweep (wrong-antenna
-        protection). Pass "" / "auto" / "current" to sweep whatever
-        band the radio is on. The amp is auto-switched to STBY for the
-        sweep and handed back to OPERATE at the end iff it was in
-        OPERATE at the start. Antenna selection stays with the
+        **The radio rules the band**: the operator slice's freq is
+        mapped to its ham band and that band is swept — ``band`` is
+        overridden with a note if it disagrees, and only trusted when
+        the radio's band can't be read ("" / "auto" / "current" with
+        an unreadable radio FAILs). The amp is auto-switched to STBY
+        for the sweep and handed back to OPERATE at the end iff it
+        was in OPERATE at the start. Antenna selection stays with the
         operator — spe-remote never touches it.
 
         Returns True on SUCCESS (every sub-band cycle succeeded). False
@@ -482,77 +486,63 @@ class TuneOrchestrator:
 
     async def _resolve_sweep_band(self, flex: FlexConnection,
                                   requested: str) -> Optional[str]:
-        """Verify (or derive) the sweep band against the radio.
+        """Pick the band to sweep — **the radio rules** (operator's
+        design call, 2026-09-02, superseding the first-cut
+        mismatch-FAIL behaviour): whenever the operator slice's freq
+        maps to a ham band, that band is swept, and a menu pick for a
+        different band is overridden with a note rather than refused.
+        The antenna hanging off the amp is the one selected for the
+        radio's band, so following the radio is always the safe
+        choice — and the operator never has to fix a stale menu pick
+        before tuning.
 
-        Reads the operator slice's current freq and maps it to its ham
-        band. ``requested`` of "" / "auto" / "current" means "sweep
-        whatever band the radio is on". An explicit band that doesn't
-        match the radio's band FAILs — the antenna hanging off the amp
-        is presumed to be the one for the radio's band, and tuning the
-        ATU through a different band's freqs into it is exactly the
-        operator error this check exists to catch. If the radio's band
-        can't be determined (no slice data, or freq outside every ham
-        band), an explicit request is trusted with a note — same
-        behaviour as before this check existed.
+        The explicit ``requested`` band only matters when the radio's
+        band can't be determined (no slice data, or freq outside every
+        ham band): then it is trusted with a note. "" / "auto" /
+        "current" with an unreadable radio FAILs (nothing to sweep).
 
-        Returns the normalized band name to sweep, or None after
-        emitting FAIL."""
+        Returns the band name to sweep, or None after emitting FAIL."""
         radio_freq = await self._wait_for_slice_freq(flex)
         radio_band = (band_for_freq(radio_freq)
                       if radio_freq is not None else None)
         amp_band = self.serial.state.band
-
         req = requested.strip().lower()
-        if req in ("", "auto", "current"):
-            if radio_band is None:
-                self._status(
-                    "FAIL",
-                    "can't derive the band to sweep — "
-                    + (f"slice {self.config.slice_rx} is at "
-                       f"{radio_freq:.4f} MHz, outside every ham band"
-                       if radio_freq is not None else
-                       f"slice {self.config.slice_rx} state not available")
-                    + "; pass an explicit band instead")
-                return None
+
+        if radio_band is not None:
+            note = ""
+            key = req if req in BAND_TABLE else req + "m"
+            if req not in ("", "auto", "current") and key != radio_band:
+                note = f" — overriding the requested {requested.strip()}"
+            if amp_band in BAND_TABLE and amp_band != radio_band:
+                # Informational only — the SPE counts the exciter freq
+                # and switches band itself once the carrier appears.
+                note += (f" (amp currently shows {amp_band}; it follows "
+                         "the exciter freq once TUNE starts)")
             self._status("BAND_CHECKED",
-                         f"radio is on {radio_band} "
-                         f"({radio_freq:.4f} MHz) — sweeping it")
+                         f"radio rules: on {radio_band} "
+                         f"({radio_freq:.4f} MHz) — sweeping {radio_band}"
+                         + note)
             return radio_band
 
+        # Radio band unknown — fall back to the explicit request.
+        why = (f"slice {self.config.slice_rx} at {radio_freq:.4f} MHz "
+               "is outside every ham band"
+               if radio_freq is not None else
+               f"slice {self.config.slice_rx} state not available")
+        if req in ("", "auto", "current"):
+            self._status("FAIL",
+                         f"can't derive the band to sweep — {why}; "
+                         "pass an explicit band instead")
+            return None
         # Normalize the same way lookup() does ("20" → "20m").
         key = req if req in BAND_TABLE else req + "m"
         if key not in BAND_TABLE:
             self._status("FAIL", f"Unknown band {requested!r}; "
                          f"known: {sorted(BAND_TABLE)}")
             return None
-
-        if radio_band is None:
-            why = (f"slice {self.config.slice_rx} at {radio_freq:.4f} MHz "
-                   "is outside every ham band"
-                   if radio_freq is not None else
-                   f"slice {self.config.slice_rx} state not available")
-            self._status("BAND_CHECKED",
-                         f"radio band unknown ({why}) — "
-                         f"trusting the requested {key}")
-            return key
-
-        if radio_band != key:
-            self._status("FAIL",
-                         f"band mismatch: sweep requested {key} but the "
-                         f"radio is on {radio_band} ({radio_freq:.4f} MHz) "
-                         f"— QSY the radio (and antenna) to {key} first, "
-                         f"or sweep {radio_band}")
-            return None
-
-        note = ""
-        if amp_band in BAND_TABLE and amp_band != key:
-            # Informational only — the SPE counts the exciter freq and
-            # switches band itself as soon as the tune carrier appears.
-            note = (f" (amp currently shows {amp_band}; it follows the "
-                    "exciter freq once TUNE starts)")
         self._status("BAND_CHECKED",
-                     f"radio on {radio_band} ({radio_freq:.4f} MHz) "
-                     f"matches requested {key}{note}")
+                     f"radio band unknown ({why}) — "
+                     f"trusting the requested {key}")
         return key
 
     async def _wait_for_slice_freq(self, flex: FlexConnection

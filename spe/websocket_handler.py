@@ -86,15 +86,17 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
                 self._tune_orchestrator.tune_single
             )
         elif message.startswith("tune_band:") and self._tune_orchestrator:
-            # Sweep the SPE manual's recommended sub-bands for one
-            # band. Payload: tune_band:20m (case-insensitive band
-            # name), or tune_band:auto (also "" / "current") to sweep
-            # whatever band the radio is on. The orchestrator verifies
-            # the requested band against the radio's slice freq
-            # (mismatch FAILs — wrong-antenna protection), drops the
-            # amp to STBY for the sweep, and restores OPERATE at the
-            # end iff it was on at the start. Antenna selection stays
-            # with the operator.
+            # Sweep the SPE manual's recommended sub-bands. THE RADIO
+            # RULES THE BAND: the orchestrator derives the band from
+            # the radio's slice freq and sweeps that, overriding the
+            # payload band with a note if it disagrees (the antenna
+            # follows the radio, so the radio's band is the safe one).
+            # The payload band (tune_band:20m, case-insensitive; also
+            # tune_band:auto / "" / "current") is only trusted when
+            # the radio's band can't be read. The amp is dropped to
+            # STBY for the sweep and OPERATE is restored at the end
+            # iff it was on at the start. Antenna selection stays with
+            # the operator.
             band = message.split(":", 1)[1].strip()
             import tornado.ioloop
             tornado.ioloop.IOLoop.current().spawn_callback(

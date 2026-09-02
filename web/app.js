@@ -236,6 +236,7 @@
     chipTX.classList.toggle("rx-on", d.tx_status === "RX");
 
     document.getElementById("bandDisplay").textContent = d.band;
+    autoSelectBand(d.band);
     document.getElementById("antDisplay").textContent = d.tx_antenna;
     document.getElementById("inputDisplay").textContent = d.input;
     document.getElementById("levelDisplay").textContent = d.p_level;
@@ -379,6 +380,25 @@
       ws.readyState !== WebSocket.OPEN;
   }
 
+  // The band picker follows the radio: the amp's band tracks the
+  // radio's freq via CAT, so every state update pre-selects that band.
+  // A manual click still works (the server only trusts it when the
+  // radio's band can't be read — otherwise the radio rules anyway),
+  // but the next band change re-follows.
+  function autoSelectBand(band) {
+    const key = String(band || "").toLowerCase();
+    if (isSweeping || !SWEEP_BANDS.includes(key) || key === selectedBand) {
+      return;
+    }
+    selectedBand = key;
+    const wrap = document.getElementById("sweepBands");
+    if (wrap) {
+      wrap.querySelectorAll("button").forEach((x) =>
+        x.classList.toggle("selected", x.dataset.band === key)
+      );
+    }
+  }
+
   // Flex connection is on-demand: opening the Sweep menu pre-warms it,
   // closing it (while idle) drops it. The server also connects lazily at
   // tune start and disconnects when the cycle is over, so this is purely
@@ -411,9 +431,9 @@
     if (isSweeping) return;
     if (!confirm(
       `Start ATU sweep on ${selectedBand}? ` +
-      `Select the antenna for ${selectedBand} on the amp first. ` +
-      `The band is verified against the radio and STBY/OPERATE ` +
-      `is handled automatically.`
+      `Select the antenna on the amp first. The radio's current ` +
+      `band rules the sweep, and STBY/OPERATE is handled ` +
+      `automatically.`
     )) return;
     isSweeping = true;
     setSweepUI({ phase: "STARTED", message: `${selectedBand} requested` });
