@@ -239,7 +239,7 @@ When `flex.enabled: true` is set in `config.yaml`, spe-remote can open a second 
 | `flex_connect` | Open the SmartSDR connection. Sent when a client opens its Sweep menu, so the radio is ready by the time the operator hits Start. Idempotent. |
 | `flex_disconnect` | Close the SmartSDR connection. Sent when a client closes its Sweep menu while idle. Ignored while a tune cycle is running. |
 | `tune_single` | Run one ATU tune cycle on the Flex's current slice freq. Sends SPE TUNE keycode, waits for the front-panel TUNE LED to come on (RCU byte 4 bit 6), tells the Flex to emit a 10 W carrier, waits for the LED to go off (ATU done), cuts the carrier. No blind timing. |
-| `tune_band:<band>` | Sweep the SPE manual's recommended in-band sub-band centers for `<band>` (`160m`, `80m`, `60m`, …, `6m`). Saves the operator's pre-sweep VFO freq + mode, hits each sub-band in turn, restores the VFO at the end. |
+| `tune_band:<band>` | Sweep the SPE manual's recommended in-band sub-band centers for `<band>` (`160m`, `80m`, `60m`, …, `6m`), or `tune_band:auto` (also `current` / empty) to sweep whatever band the radio is on. Verifies the requested band against the radio's slice freq first — a mismatch FAILs the sweep (wrong-antenna protection). Auto-switches the amp to STBY, saves the operator's pre-sweep VFO freq + mode, hits each sub-band in turn, then restores the VFO and hands OPERATE back iff it was on at the start. |
 | `tune_stop` | Abort an in-progress single tune or sweep. The carrier-off command runs in a `finally` block — a stopped cycle always drops the carrier before exiting. |
 
 **On-demand connection (the radio is only held while tuning).** spe-remote does **not** open the SmartSDR session at startup. The connection is established when the operator opens the Sweep menu (`flex_connect`) and is dropped again as soon as the tune cycle or band sweep finishes — so the radio isn't marked "in use" by spe-remote the rest of the time, and it can be powered off until you actually need it (host discovery is deferred too). As a safety net the server also connects lazily at the start of any `tune_single` / `tune_band`, so a client that never sends `flex_connect` still works. Connection transitions broadcast as `tune_event` phases `FLEX_CONNECTING` → `FLEX_CONNECTED` → `FLEX_DISCONNECTED` (or `FLEX_ERROR`).
@@ -247,8 +247,10 @@ When `flex.enabled: true` is set in `config.yaml`, spe-remote can open a second 
 Phase progress streams back to every connected client as JSON broadcasts on the same WS:
 
 ```json
+{"tune_event": "BAND_CHECKED",  "tune_message": "radio on 20m (14.0740 MHz) matches requested 20m"}
+{"tune_event": "VFO_SAVED",     "tune_message": "slice 0: 14.074000 MHz USB"}
+{"tune_event": "STBY_SET",      "tune_message": "amp switched OPERATE → STBY (OPERATE will be restored when the tune is done)"}
 {"tune_event": "SWEEP_STARTED", "tune_message": "20m: 7 sub-bands (14.025–14.325 MHz)", "ts": 1781867...}
-{"tune_event": "VFO_SAVED",     "tune_message": "slice 0: 7.007200 MHz LSB"}
 {"tune_event": "SWEEP_STEP",    "tune_message": "1/7: 14.0250 MHz"}
 {"tune_event": "STARTED",       "tune_message": "freq=14.025"}
 {"tune_event": "LED_ON",        "tune_message": ""}
@@ -258,7 +260,8 @@ Phase progress streams back to every connected client as JSON broadcasts on the 
 {"tune_event": "SUCCESS",       "tune_message": "cycle complete"}
 ... (next sub-band)
 {"tune_event": "SWEEP_DONE",    "tune_message": "7/7 sub-bands tuned on 20m"}
-{"tune_event": "VFO_RESTORED",  "tune_message": "slice 0: 7.007200 MHz LSB"}
+{"tune_event": "VFO_RESTORED",  "tune_message": "slice 0: 14.074000 MHz USB"}
+{"tune_event": "OPER_RESTORED", "tune_message": "amp restored STBY → OPERATE"}
 ```
 
 Four UIs render the same broadcast stream as a sweep panel:
@@ -296,7 +299,7 @@ The sub-band centers come from the SPE 1.5K-FA User Manual rev 3.2, Section 19 �
 ### Constraints
 
 - **One rig per Pi.** spe-remote talks to one Flex; multi-rig setups need separate config / Pi.
-- **Operator picks band + antenna.** Per the SPE manual's procedure: select band, choose antenna with `[ANT]`, *then* trigger the sweep. spe-remote does not change band or antenna.
+- **Operator picks the antenna; the band is verified, not trusted.** Per the SPE manual's procedure the antenna is chosen with `[ANT]` before the sweep — spe-remote never touches antenna selection. The band, though, is checked: the radio's slice freq is mapped to its ham band and a sweep request for a different band FAILs before anything is keyed (the antenna on the amp is presumed to match the radio's band). `tune_band:auto` sweeps the radio's current band directly. STBY/OPERATE is handled for you — the amp is dropped to STBY for the sweep and OPERATE is restored afterwards iff it was on when the sweep started.
 - **Ethernet interlock not used.** SmartSDR's `interlock create type=AMP` is rejected by older firmware (1.4.0.0 in our test rig); direct `transmit tune on` works fine without it. Re-evaluate when newer firmware is in play.
 
 ## SPE Serial Protocol
@@ -623,7 +626,7 @@ Clients send bare command names as WebSocket text messages. The server dispatche
 | `flex_connect` | Open the SmartSDR connection (on Sweep-menu open). Idempotent. |
 | `flex_disconnect` | Close it (on idle Sweep-menu close). Ignored mid-tune. |
 | `tune_single` | One ATU tune cycle at the slice's current freq |
-| `tune_band:<band>` | Sweep the manual's sub-bands for `<band>` (e.g. `tune_band:20m`) |
+| `tune_band:<band>` | Sweep the manual's sub-bands for `<band>` (e.g. `tune_band:20m`; `tune_band:auto` = the radio's current band). Band verified against the radio; amp auto-STBY'd, OPERATE restored after |
 | `tune_stop` | Abort an in-progress tune/sweep (always drops the carrier) |
 
 Progress streams back as `{"tune_event": <phase>, "tune_message": <text>, "ts": <t>}` — see the linked section for the full phase vocabulary, including the `FLEX_CONNECTING` / `FLEX_CONNECTED` / `FLEX_DISCONNECTED` connection-lifecycle phases.

@@ -342,9 +342,10 @@
   // Sends `tune_band:<band>` and `tune_stop` over WS; reacts to the
   // server's `tune_event` JSON broadcasts to drive the panel UI.
   // Phases the server emits (see spe/tune_orchestrator.py PHASES):
-  //   STARTED PREFLIGHT_OK VFO_SAVED FREQ_SET TUNE_SENT LED_ON
-  //   CARRIER_ON LED_OFF CARRIER_OFF VFO_RESTORED SUCCESS FAIL ABORT
-  //   SWEEP_STARTED SWEEP_STEP SWEEP_DONE
+  //   STARTED PREFLIGHT_OK STBY_SET OPER_RESTORED VFO_SAVED FREQ_SET
+  //   TUNE_SENT LED_ON CARRIER_ON LED_OFF CARRIER_OFF VFO_RESTORED
+  //   SUCCESS FAIL ABORT
+  //   BAND_CHECKED SWEEP_STARTED SWEEP_STEP SWEEP_DONE
   //
   // Terminal phases that release the Start button: SUCCESS FAIL
   // ABORT SWEEP_DONE.
@@ -410,7 +411,9 @@
     if (isSweeping) return;
     if (!confirm(
       `Start ATU sweep on ${selectedBand}? ` +
-      `Amp must be in STBY and the antenna for ${selectedBand} selected.`
+      `Select the antenna for ${selectedBand} on the amp first. ` +
+      `The band is verified against the radio and STBY/OPERATE ` +
+      `is handled automatically.`
     )) return;
     isSweeping = true;
     setSweepUI({ phase: "STARTED", message: `${selectedBand} requested` });

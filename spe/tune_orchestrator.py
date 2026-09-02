@@ -26,6 +26,15 @@ Design notes:
     rejected the ethernet-interlock commands, and direct
     ``transmit tune on`` was accepted without needing the dance.
     Re-evaluate when newer firmware is in play.
+  * Leave the amp how we found it: tune_single/tune_band drop the amp
+    to STBY themselves (CMD_OPERATE toggle, verified via CSV
+    op_status) and hand OPERATE back at the end iff it was on at the
+    start. The per-cycle preflight still hard-checks STBY as a safety
+    net against mid-sweep front-panel flips.
+  * Trust but verify the band: tune_band maps the radio's slice freq
+    to its ham band and refuses a sweep on a different band than the
+    radio is on (wrong-antenna protection). Antenna selection itself
+    stays with the operator — spe-remote never touches it.
 """
 
 from __future__ import annotations
@@ -38,7 +47,7 @@ from spe.config import FlexConfig
 from spe.flex import FlexConnection, FlexProtocolError
 from spe.flex_controller import FlexController
 from spe.serial_handler import SerialHandler
-from spe.spe_band_table import BAND_TABLE, lookup as lookup_band
+from spe.spe_band_table import BAND_TABLE, band_for_freq, lookup as lookup_band
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +68,17 @@ TUNE_SWEEP_TIMEOUT = 10.0
 # we observe each transition within ~100 ms of the next RCU update.
 _POLL_INTERVAL = 0.1
 
+# Time the amp gets to reflect an OPERATE↔STBY toggle (CMD_OPERATE
+# keycode) in its CSV op_status. Idle CSV polling runs at ~1 s
+# intervals, so 4 s covers several status frames of slack.
+OPER_SWITCH_TIMEOUT = 4.0
+
+# Time we allow the Flex's post-connect ``sub slice all`` events to
+# populate the slice cache before the band check gives up on reading
+# the radio's freq. Slice status normally arrives within tens of ms
+# of the subscription; 2 s is generous.
+SLICE_STATE_TIMEOUT = 2.0
+
 
 # Status phases emitted via on_status. The orchestrator always ends
 # in one of SUCCESS, FAIL, or ABORT — those are the terminal states
@@ -66,6 +86,10 @@ _POLL_INTERVAL = 0.1
 PHASES = (
     "STARTED",         # cycle accepted; preflight begins
     "PREFLIGHT_OK",    # amp in STBY, carrier off, ready to send TUNE
+    "STBY_SET",        # amp confirmed in STBY (auto-switched from OPERATE
+                       # if needed, remembering the prior mode)
+    "OPER_RESTORED",   # amp handed back to OPERATE at the end (only when
+                       # it was in OPERATE at the start)
     "VFO_SAVED",       # operator's freq+mode snapshotted before any change
     "FREQ_SET",        # Flex slice tuned to target freq (only if override)
     "TUNE_SENT",       # SPE TUNE keycode written
@@ -79,6 +103,8 @@ PHASES = (
     "ABORT",           # terminal: external stop() while running
     # Band-sweep phases — emitted in addition to the per-cycle phases
     # above when tune_band() is running.
+    "BAND_CHECKED",    # requested sweep band verified against (or derived
+                       # from) the radio's current slice frequency
     "SWEEP_STARTED",   # band sweep accepted; first sub-band about to start
     "SWEEP_STEP",      # next sub-band's tune cycle is about to begin
     "SWEEP_DONE",      # terminal: all sub-bands tuned cleanly
@@ -152,6 +178,9 @@ class TuneOrchestrator:
         restored after the cycle. Omit ``freq_mhz`` to tune at whatever
         freq the slice is already on (no save/restore needed in that
         case — the slice didn't move).
+
+        The amp is auto-switched to STBY for the cycle and handed back
+        to OPERATE at the end iff it was in OPERATE at the start.
         """
         if self._running:
             self._status("FAIL", "Tune already in progress")
@@ -159,6 +188,7 @@ class TuneOrchestrator:
 
         self._running = True
         self._stop_requested.clear()
+        was_operate = False
         try:
             flex = await self._acquire_flex()
             if flex is None:
@@ -166,22 +196,41 @@ class TuneOrchestrator:
                 return False
             snap = self._snapshot_slice(flex) if freq_mhz is not None else None
             try:
+                stby = await self._ensure_stby()
+                if stby is None:
+                    return False
+                was_operate = stby
                 return await self._run_one_cycle(flex, freq_mhz)
             finally:
                 if snap is not None:
                     await self._restore_slice(flex, snap)
+        except asyncio.CancelledError:
+            # stop() while waiting for the STBY switch — _run_one_cycle
+            # catches its own cancellations, so this only fires outside
+            # it. The finally below still restores OPERATE if owed.
+            self._status("ABORT", "cancelled")
+            return False
         finally:
+            if was_operate:
+                await self._restore_operate()
             # Disconnect once the cycle is over, per the on-demand
             # lifecycle — the radio is only held while actually tuning.
             await self._release_flex()
             self._running = False
 
-    async def tune_band(self, band: str) -> bool:
+    async def tune_band(self, band: str = "") -> bool:
         """Sweep the SPE manual's recommended sub-band central frequencies
         for ``band`` (e.g. "20m", "40m"). For each sub-band, sets the
-        Flex slice freq + runs a full tune cycle. The operator is
-        responsible for picking the band and antenna *before* calling
-        — spe-remote does not change either.
+        Flex slice freq + runs a full tune cycle.
+
+        The requested band is verified against the radio before
+        anything moves: the operator slice's freq is mapped to its ham
+        band, and a mismatch FAILs the sweep (wrong-antenna
+        protection). Pass "" / "auto" / "current" to sweep whatever
+        band the radio is on. The amp is auto-switched to STBY for the
+        sweep and handed back to OPERATE at the end iff it was in
+        OPERATE at the start. Antenna selection stays with the
+        operator — spe-remote never touches it.
 
         Returns True on SUCCESS (every sub-band cycle succeeded). False
         if any sub-band failed or the sweep was stopped — the per-cycle
@@ -191,28 +240,36 @@ class TuneOrchestrator:
             self._status("FAIL", "Tune already in progress")
             return False
 
-        try:
-            centers_khz = lookup_band(band)
-            raw_total = len(BAND_TABLE.get(band.strip().lower().rstrip("m") + "m",
-                                            BAND_TABLE.get(band.strip().lower(), [])))
-        except KeyError as e:
-            self._status("FAIL", str(e))
-            return False
-
-        if not centers_khz:
-            self._status("FAIL", f"{band}: no in-band sub-bands to sweep")
-            return False
-
         self._running = True
         self._stop_requested.clear()
         flex = None
         snap = None
+        was_operate = False
         try:
             flex = await self._acquire_flex()
             if flex is None:
                 self._status("FAIL", "Flex radio not reachable")
                 return False
+
+            band = await self._resolve_sweep_band(flex, band)
+            if band is None:
+                return False
+
+            # Band name is validated by _resolve_sweep_band, so these
+            # lookups can't raise.
+            centers_khz = lookup_band(band)
+            if not centers_khz:
+                self._status("FAIL", f"{band}: no in-band sub-bands to sweep")
+                return False
+            raw_total = len(lookup_band(band, in_band_only=False))
+
             snap = self._snapshot_slice(flex)
+
+            stby = await self._ensure_stby()
+            if stby is None:
+                return False
+            was_operate = stby
+
             total = len(centers_khz)
             skipped = raw_total - total
             note = (f" ({skipped} out-of-band entries from the manual skipped)"
@@ -255,12 +312,23 @@ class TuneOrchestrator:
                          f"{completed}/{total} sub-bands tuned on {band}")
             return True
 
+        except asyncio.CancelledError:
+            # stop() during band check / STBY switch — the per-cycle
+            # code catches its own cancellations, so this only fires
+            # outside _run_one_cycle. The finally below still restores
+            # the VFO and OPERATE if owed.
+            self._status("ABORT", "cancelled")
+            return False
         finally:
             # Restore the operator's pre-sweep VFO + mode before we
             # release _running. Best effort — log on failure but don't
             # mask whatever terminal phase the sweep produced.
             if flex is not None and snap is not None:
                 await self._restore_slice(flex, snap)
+            # Hand the amp back to OPERATE last, after the carrier is
+            # guaranteed off (per-cycle finally) and the VFO is back.
+            if was_operate:
+                await self._restore_operate()
             # Disconnect now the sweep is over (on-demand lifecycle).
             await self._release_flex()
             self._running = False
@@ -411,6 +479,168 @@ class TuneOrchestrator:
         except Exception as e:
             logger.exception("Failed to restore slice freq+mode")
             self._status("FAIL", f"VFO restore: {e}")
+
+    async def _resolve_sweep_band(self, flex: FlexConnection,
+                                  requested: str) -> Optional[str]:
+        """Verify (or derive) the sweep band against the radio.
+
+        Reads the operator slice's current freq and maps it to its ham
+        band. ``requested`` of "" / "auto" / "current" means "sweep
+        whatever band the radio is on". An explicit band that doesn't
+        match the radio's band FAILs — the antenna hanging off the amp
+        is presumed to be the one for the radio's band, and tuning the
+        ATU through a different band's freqs into it is exactly the
+        operator error this check exists to catch. If the radio's band
+        can't be determined (no slice data, or freq outside every ham
+        band), an explicit request is trusted with a note — same
+        behaviour as before this check existed.
+
+        Returns the normalized band name to sweep, or None after
+        emitting FAIL."""
+        radio_freq = await self._wait_for_slice_freq(flex)
+        radio_band = (band_for_freq(radio_freq)
+                      if radio_freq is not None else None)
+        amp_band = self.serial.state.band
+
+        req = requested.strip().lower()
+        if req in ("", "auto", "current"):
+            if radio_band is None:
+                self._status(
+                    "FAIL",
+                    "can't derive the band to sweep — "
+                    + (f"slice {self.config.slice_rx} is at "
+                       f"{radio_freq:.4f} MHz, outside every ham band"
+                       if radio_freq is not None else
+                       f"slice {self.config.slice_rx} state not available")
+                    + "; pass an explicit band instead")
+                return None
+            self._status("BAND_CHECKED",
+                         f"radio is on {radio_band} "
+                         f"({radio_freq:.4f} MHz) — sweeping it")
+            return radio_band
+
+        # Normalize the same way lookup() does ("20" → "20m").
+        key = req if req in BAND_TABLE else req + "m"
+        if key not in BAND_TABLE:
+            self._status("FAIL", f"Unknown band {requested!r}; "
+                         f"known: {sorted(BAND_TABLE)}")
+            return None
+
+        if radio_band is None:
+            why = (f"slice {self.config.slice_rx} at {radio_freq:.4f} MHz "
+                   "is outside every ham band"
+                   if radio_freq is not None else
+                   f"slice {self.config.slice_rx} state not available")
+            self._status("BAND_CHECKED",
+                         f"radio band unknown ({why}) — "
+                         f"trusting the requested {key}")
+            return key
+
+        if radio_band != key:
+            self._status("FAIL",
+                         f"band mismatch: sweep requested {key} but the "
+                         f"radio is on {radio_band} ({radio_freq:.4f} MHz) "
+                         f"— QSY the radio (and antenna) to {key} first, "
+                         f"or sweep {radio_band}")
+            return None
+
+        note = ""
+        if amp_band in BAND_TABLE and amp_band != key:
+            # Informational only — the SPE counts the exciter freq and
+            # switches band itself as soon as the tune carrier appears.
+            note = (f" (amp currently shows {amp_band}; it follows the "
+                    "exciter freq once TUNE starts)")
+        self._status("BAND_CHECKED",
+                     f"radio on {radio_band} ({radio_freq:.4f} MHz) "
+                     f"matches requested {key}{note}")
+        return key
+
+    async def _wait_for_slice_freq(self, flex: FlexConnection
+                                   ) -> Optional[float]:
+        """Return the operator slice's current freq (MHz), waiting up
+        to SLICE_STATE_TIMEOUT for the post-connect ``sub slice all``
+        events to populate the cache. None if it never shows up (or
+        doesn't parse) — callers treat that as 'radio band unknown'."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + SLICE_STATE_TIMEOUT
+        while loop.time() < deadline:
+            if self._stop_requested.is_set():
+                return None
+            state = flex.slice_state.get(self.config.slice_rx)
+            freq = state.get("RF_frequency") if state else None
+            if freq is not None:
+                try:
+                    return float(freq)
+                except ValueError:
+                    return None
+            await asyncio.sleep(_POLL_INTERVAL)
+        return None
+
+    async def _ensure_stby(self) -> Optional[bool]:
+        """Put the amp in STBY before tuning, remembering whether it
+        was in OPERATE so the caller can hand OPERATE back afterwards.
+
+        Returns True if the amp was in OPERATE and we toggled it to
+        STBY, False if it was already in STBY (nothing to restore
+        later), or None if the toggle didn't take (FAIL emitted —
+        caller should bail).
+
+        CMD_OPERATE is a *toggle*, not an absolute set, so the result
+        is verified from the CSV op_status rather than assumed."""
+        if self.serial.state.op_status != "Oper":
+            self._status("STBY_SET", "amp already in STBY")
+            return False
+        self.serial.send_command("oper")
+        if not await self._wait_for_op_status("Stby", OPER_SWITCH_TIMEOUT):
+            self._status("FAIL",
+                         "amp didn't drop to STBY within "
+                         f"{OPER_SWITCH_TIMEOUT}s of the OPERATE toggle "
+                         f"(still {self.serial.state.op_status!r})")
+            return None
+        self._status("STBY_SET", "amp switched OPERATE → STBY "
+                     "(OPERATE will be restored when the tune is done)")
+        return True
+
+    async def _restore_operate(self) -> None:
+        """Hand the amp back to OPERATE after a tune that auto-switched
+        it to STBY. Cleanup-path best effort: never raises; emits
+        OPER_RESTORED on success, FAIL if the amp won't switch back."""
+        try:
+            if self.serial.state.op_status == "Oper":
+                # Operator (or front panel) already put it back.
+                self._status("OPER_RESTORED", "amp already back in OPERATE")
+                return
+            self.serial.send_command("oper")
+            if await self._wait_for_op_status("Oper", OPER_SWITCH_TIMEOUT,
+                                              ignore_stop=True):
+                self._status("OPER_RESTORED",
+                             "amp restored STBY → OPERATE")
+            else:
+                self._status("FAIL",
+                             "couldn't restore OPERATE — amp still "
+                             f"{self.serial.state.op_status!r} after "
+                             f"{OPER_SWITCH_TIMEOUT}s; check the front panel")
+        except Exception as e:
+            logger.exception("Failed to restore OPERATE")
+            self._status("FAIL", f"OPERATE restore: {e}")
+
+    async def _wait_for_op_status(self, expected: str, timeout: float,
+                                  ignore_stop: bool = False) -> bool:
+        """Poll ``serial.state.op_status`` until it equals ``expected``
+        or ``timeout`` elapses. Returns True on match. Raises
+        asyncio.CancelledError if stop() was requested, unless
+        ``ignore_stop`` — the OPERATE-restore path runs in cleanup,
+        where the stop flag is often still set from the abort that got
+        us there."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if not ignore_stop and self._stop_requested.is_set():
+                raise asyncio.CancelledError()
+            if self.serial.state.op_status == expected:
+                return True
+            await asyncio.sleep(_POLL_INTERVAL)
+        return False
 
     async def _wait_for_tune_active(self, expected: bool, timeout: float) -> bool:
         """Poll ``serial.last_tune_active`` until it equals ``expected``

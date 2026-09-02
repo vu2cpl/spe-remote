@@ -21,7 +21,7 @@ case-insensitive at the API boundary (see ``lookup``).
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 
 BAND_TABLE: dict[str, List[int]] = {
@@ -121,6 +121,18 @@ HAM_BAND_EDGES: dict[str, tuple[int, int]] = {
     "10m":  (28000, 29700),
     "6m":   (50000, 54000),
 }
+
+
+def band_for_freq(freq_mhz: float) -> Optional[str]:
+    """Map a frequency (MHz) to the amateur band containing it, per
+    ``HAM_BAND_EDGES``. Returns None when the freq sits outside every
+    ham band (general-coverage RX, broadcast, torn value, ...) — the
+    caller decides whether that's a warning or a hard stop."""
+    freq_khz = freq_mhz * 1000.0
+    for band, (low_khz, high_khz) in HAM_BAND_EDGES.items():
+        if low_khz <= freq_khz <= high_khz:
+            return band
+    return None
 
 
 def lookup(band: str, in_band_only: bool = True) -> List[int]:
