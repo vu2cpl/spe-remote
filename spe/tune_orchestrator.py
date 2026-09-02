@@ -82,6 +82,15 @@ OPER_SWITCH_TIMEOUT = 4.0
 # of the subscription; 2 s is generous.
 SLICE_STATE_TIMEOUT = 2.0
 
+# Mode the slice is switched to for the duration of a tune. CW keys
+# its carrier exactly on the dial freq; DIGU/DIGL (and RTTY) carry a
+# TX offset that shifts the actual carrier, which near a band edge
+# lands outside the band and makes the Flex refuse to key — operator-
+# observed failure mode 2026-09-02, and the operator's own workaround
+# ("switch to CW and tune") is what this automates. The pre-tune mode
+# is restored afterwards by the existing VFO snapshot/restore.
+TUNE_MODE = "CW"
+
 
 # Status phases emitted via on_status. The orchestrator always ends
 # in one of SUCCESS, FAIL, or ABORT — those are the terminal states
@@ -94,6 +103,9 @@ PHASES = (
     "OPER_RESTORED",   # amp handed back to OPERATE at the end (only when
                        # it was in OPERATE at the start)
     "VFO_SAVED",       # operator's freq+mode snapshotted before any change
+    "MODE_SET",        # slice switched to CW for the tune (avoids the
+                       # DIGU/DIGL TX offset near band edges; the saved
+                       # mode comes back with VFO_RESTORED)
     "FREQ_SET",        # Flex slice tuned to target freq (only if override)
     "TUNE_SENT",       # SPE TUNE keycode written
     "LED_ON",          # SPE confirmed TUNE entry (byte 4 bit 6 CLEAR)
@@ -178,10 +190,11 @@ class TuneOrchestrator:
         """Run a single tune cycle. Returns True on SUCCESS, else False.
 
         ``freq_mhz`` overrides the Flex slice frequency before keying;
-        the operator's pre-call freq + mode are snapshotted and
-        restored after the cycle. Omit ``freq_mhz`` to tune at whatever
-        freq the slice is already on (no save/restore needed in that
-        case — the slice didn't move).
+        omit it to tune at whatever freq the slice is already on. The
+        operator's pre-call freq + mode are snapshotted and restored
+        after the cycle either way — the slice is switched to CW for
+        the tune (see ``TUNE_MODE``), so there is always something to
+        put back.
 
         The amp is auto-switched to STBY for the cycle and handed back
         to OPERATE at the end iff it was in OPERATE at the start.
@@ -198,8 +211,13 @@ class TuneOrchestrator:
             if flex is None:
                 self._status("FAIL", "Flex radio not reachable")
                 return False
-            snap = self._snapshot_slice(flex) if freq_mhz is not None else None
+            # Snapshot unconditionally — even a current-freq tune now
+            # touches the slice (mode → CW), so there is always
+            # something to restore.
+            snap = self._snapshot_slice(flex)
             try:
+                if not await self._set_tune_mode(flex, snap):
+                    return False
                 stby = await self._ensure_stby()
                 if stby is None:
                     return False
@@ -268,6 +286,9 @@ class TuneOrchestrator:
             raw_total = len(lookup_band(band, in_band_only=False))
 
             snap = self._snapshot_slice(flex)
+
+            if not await self._set_tune_mode(flex, snap):
+                return False
 
             stby = await self._ensure_stby()
             if stby is None:
@@ -544,6 +565,33 @@ class TuneOrchestrator:
                      f"radio band unknown ({why}) — "
                      f"trusting the requested {key}")
         return key
+
+    async def _set_tune_mode(self, flex: FlexConnection,
+                             snap: Optional[dict]) -> bool:
+        """Switch the slice to ``TUNE_MODE`` (CW) for the tune so the
+        carrier lands exactly on the dial freq — DIGU/DIGL's TX offset
+        otherwise shifts it, and near a band edge that puts the
+        carrier out of band, where the Flex refuses to key. Only done
+        when the pre-tune mode is known (``snap``), since that's what
+        guarantees ``_restore_slice`` can put it back. Returns False
+        after emitting FAIL on a protocol error."""
+        mode = (snap or {}).get("mode")
+        if mode is None:
+            self._status("MODE_SET",
+                         "slice mode unknown — leaving it untouched")
+            return True
+        if str(mode).upper() == TUNE_MODE:
+            return True  # already CW; nothing to change
+        try:
+            await flex.set_slice_mode(self.config.slice_rx, TUNE_MODE)
+        except FlexProtocolError as e:
+            self._status("FAIL", f"set_slice_mode({TUNE_MODE}): {e}")
+            return False
+        self._status("MODE_SET",
+                     f"slice {self.config.slice_rx} → {TUNE_MODE} for the "
+                     f"tune (was {mode}, restored after — DIGU/DIGL TX "
+                     "offset would shift the carrier past a band edge)")
+        return True
 
     async def _wait_for_slice_freq(self, flex: FlexConnection
                                    ) -> Optional[float]:
