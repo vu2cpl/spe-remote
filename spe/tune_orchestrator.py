@@ -7,12 +7,13 @@ the SPE 1.5K-FA:
      read the live ``last_tune_active`` flag (byte 4 bit 6 of each
      incoming RCU frame, set CLEAR when the front-panel TUNE LED is
      lit) to detect tune entry and ATU completion.
-  2. FlexConnection — set slice freq and tune power, key the built-in
-     tune carrier on / off.
+  2. RadioConnection — set the channel's freq/mode and tune power,
+     key the built-in tune carrier on / off. The backend is whichever
+     rig the client selected (Flex over SmartSDR, SunSDR over TCI).
   3. status callback — relay phase transitions out to WS clients so
      MacExpert / the browser dashboard can render progress.
 
-Phase 2a scope: a single cycle on the Flex's current freq (or an
+Phase 2a scope: a single cycle on the radio's current freq (or an
 optional override). Phase 2b will wrap this in a band-sweep loop.
 
 Design notes:
@@ -31,7 +32,7 @@ Design notes:
     op_status) and hand OPERATE back at the end iff it was on at the
     start. The per-cycle preflight still hard-checks STBY as a safety
     net against mid-sweep front-panel flips.
-  * The radio rules the band: tune_band maps the radio's slice freq
+  * The radio rules the band: tune_band maps the radio's current freq
     to its ham band and sweeps THAT band — a menu pick for a
     different band is overridden with a note, never refused
     (operator's call: the antenna follows the radio, so the radio's
@@ -46,9 +47,8 @@ import asyncio
 import logging
 from typing import Callable, Optional
 
-from spe.config import FlexConfig
-from spe.flex import FlexConnection, FlexProtocolError
-from spe.flex_controller import FlexController
+from spe.radio import RadioConnection
+from spe.radio_controller import RadioController
 from spe.serial_handler import SerialHandler
 from spe.spe_band_table import BAND_TABLE, band_for_freq, lookup as lookup_band
 
@@ -76,16 +76,16 @@ _POLL_INTERVAL = 0.1
 # intervals, so 4 s covers several status frames of slack.
 OPER_SWITCH_TIMEOUT = 4.0
 
-# Time we allow the Flex's post-connect ``sub slice all`` events to
-# populate the slice cache before the band check gives up on reading
-# the radio's freq. Slice status normally arrives within tens of ms
-# of the subscription; 2 s is generous.
-SLICE_STATE_TIMEOUT = 2.0
+# Time we allow the backend's own event stream (a Flex's post-connect
+# ``sub slice all`` events, TCI's startup dump) to populate its state
+# cache before the band check gives up on reading the radio's freq.
+# Channel status normally arrives within tens of ms; 2 s is generous.
+RADIO_STATE_TIMEOUT = 2.0
 
-# Mode the slice is switched to for the duration of a tune. CW keys
+# Mode the channel is switched to for the duration of a tune. CW keys
 # its carrier exactly on the dial freq; DIGU/DIGL (and RTTY) carry a
 # TX offset that shifts the actual carrier, which near a band edge
-# lands outside the band and makes the Flex refuse to key — operator-
+# lands outside the band and makes the rig refuse to key — operator-
 # observed failure mode 2026-09-02, and the operator's own workaround
 # ("switch to CW and tune") is what this automates. The pre-tune mode
 # is restored afterwards by the existing VFO snapshot/restore.
@@ -103,35 +103,39 @@ PHASES = (
     "OPER_RESTORED",   # amp handed back to OPERATE at the end (only when
                        # it was in OPERATE at the start)
     "VFO_SAVED",       # operator's freq+mode snapshotted before any change
-    "MODE_SET",        # slice switched to CW for the tune (avoids the
+    "MODE_SET",        # channel switched to CW for the tune (avoids the
                        # DIGU/DIGL TX offset near band edges; the saved
                        # mode comes back with VFO_RESTORED)
-    "FREQ_SET",        # Flex slice tuned to target freq (only if override)
+    "FREQ_SET",        # radio channel tuned to target freq (only if override)
     "TUNE_SENT",       # SPE TUNE keycode written
     "LED_ON",          # SPE confirmed TUNE entry (byte 4 bit 6 CLEAR)
-    "CARRIER_ON",      # Flex tune carrier on; ATU should now sweep
+    "CARRIER_ON",      # radio tune carrier on; ATU should now sweep
     "LED_OFF",         # SPE LED off — ATU done (or aborted internally)
-    "CARRIER_OFF",     # Flex carrier stopped
-    "VFO_RESTORED",    # operator's saved freq+mode written back
+    "CARRIER_OFF",     # radio carrier stopped
+    "VFO_RESTORED",    # operator's saved freq+mode written back — only
+                       # emitted when the radio actually took it; a
+                       # failed restore is a FAIL instead
     "SUCCESS",         # terminal: single cycle completed cleanly
     "FAIL",            # terminal: error during the cycle (message has why)
     "ABORT",           # terminal: external stop() while running
     # Band-sweep phases — emitted in addition to the per-cycle phases
     # above when tune_band() is running.
-    "BAND_CHECKED",    # sweep band resolved from the radio's slice freq
+    "BAND_CHECKED",    # sweep band resolved from the radio's current freq
                        # (radio rules; the explicit pick is used only when
                        # the radio's band can't be read)
     "SWEEP_STARTED",   # band sweep accepted; first sub-band about to start
     "SWEEP_STEP",      # next sub-band's tune cycle is about to begin
     "SWEEP_DONE",      # terminal: all sub-bands tuned cleanly
-    # Flex connection-lifecycle phases — emitted by FlexController on the
+    # Radio connection-lifecycle phases — emitted by RadioController on the
     # same channel as the connection is opened on Sweep-menu open / tune
     # start and closed when the cycle is over. Listed here so clients have
     # the full phase vocabulary in one place.
-    "FLEX_CONNECTING",
-    "FLEX_CONNECTED",
-    "FLEX_DISCONNECTED",
-    "FLEX_ERROR",
+    "RADIO_CONNECTING",
+    "RADIO_CONNECTED",
+    "RADIO_DISCONNECTED",
+    "RADIO_ERROR",
+    "RADIO_CONFIG_UPDATED",   # a client's set_radio_config was applied
+                              # (emitted by the WS handler, not here)
 )
 
 
@@ -149,31 +153,30 @@ class TuneOrchestrator:
     def __init__(
         self,
         serial_handler: SerialHandler,
-        flex_controller: FlexController,
-        config: FlexConfig,
+        radio_controller: RadioController,
         on_status: Optional[StatusCallback] = None,
     ):
         self.serial = serial_handler
         # The connection is opened on demand via the controller (see
-        # _acquire_flex / _release_flex), not held for the server's life.
-        self.flex_controller = flex_controller
-        self.config = config
+        # _acquire_radio / _release_radio), not held for the server's life.
+        # The controller also knows the active backend, channel, and power.
+        self.radio_controller = radio_controller
         self.on_status = on_status
 
         self._running = False
         self._stop_requested = asyncio.Event()
 
-    async def _acquire_flex(self) -> Optional[FlexConnection]:
-        """Open (or reuse) the Flex connection for a tune cycle.
+    async def _acquire_radio(self) -> Optional[RadioConnection]:
+        """Open (or reuse) the radio connection for a tune cycle.
 
         Returns the live connection, or None if it couldn't be
-        established — in which case FlexController has already emitted a
-        FLEX_ERROR status, and the caller should emit FAIL and bail."""
-        return await self.flex_controller.connect()
+        established — in which case RadioController has already emitted a
+        RADIO_ERROR status, and the caller should emit FAIL and bail."""
+        return await self.radio_controller.connect()
 
-    async def _release_flex(self) -> None:
-        """Drop the Flex connection now the cycle is over. Best effort."""
-        await self.flex_controller.disconnect()
+    async def _release_radio(self) -> None:
+        """Drop the radio connection now the cycle is over. Best effort."""
+        await self.radio_controller.disconnect()
 
     def _status(self, phase: str, message: str = "") -> None:
         """Emit a phase transition. Internal logging at INFO; the
@@ -189,10 +192,10 @@ class TuneOrchestrator:
     async def tune_single(self, freq_mhz: Optional[float] = None) -> bool:
         """Run a single tune cycle. Returns True on SUCCESS, else False.
 
-        ``freq_mhz`` overrides the Flex slice frequency before keying;
-        omit it to tune at whatever freq the slice is already on. The
+        ``freq_mhz`` overrides the radio's frequency before keying;
+        omit it to tune at whatever freq the rig is already on. The
         operator's pre-call freq + mode are snapshotted and restored
-        after the cycle either way — the slice is switched to CW for
+        after the cycle either way — the channel is switched to CW for
         the tune (see ``TUNE_MODE``), so there is always something to
         put back.
 
@@ -207,25 +210,25 @@ class TuneOrchestrator:
         self._stop_requested.clear()
         was_operate = False
         try:
-            flex = await self._acquire_flex()
-            if flex is None:
-                self._status("FAIL", "Flex radio not reachable")
+            radio = await self._acquire_radio()
+            if radio is None:
+                self._status("FAIL", "Radio not reachable")
                 return False
             # Snapshot unconditionally — even a current-freq tune now
-            # touches the slice (mode → CW), so there is always
+            # touches the channel (mode → CW), so there is always
             # something to restore.
-            snap = self._snapshot_slice(flex)
+            snap = self._snapshot(radio)
             try:
-                if not await self._set_tune_mode(flex, snap):
+                if not await self._set_tune_mode(radio, snap):
                     return False
                 stby = await self._ensure_stby()
                 if stby is None:
                     return False
                 was_operate = stby
-                return await self._run_one_cycle(flex, freq_mhz)
+                return await self._run_one_cycle(radio, freq_mhz)
             finally:
                 if snap is not None:
-                    await self._restore_slice(flex, snap)
+                    await self._restore(radio, snap)
         except asyncio.CancelledError:
             # stop() while waiting for the STBY switch — _run_one_cycle
             # catches its own cancellations, so this only fires outside
@@ -237,7 +240,7 @@ class TuneOrchestrator:
                 await self._restore_operate()
             # Disconnect once the cycle is over, per the on-demand
             # lifecycle — the radio is only held while actually tuning.
-            await self._release_flex()
+            await self._release_radio()
             self._running = False
 
     async def tune_band(self, band: str = "") -> bool:
@@ -264,16 +267,16 @@ class TuneOrchestrator:
 
         self._running = True
         self._stop_requested.clear()
-        flex = None
+        radio = None
         snap = None
         was_operate = False
         try:
-            flex = await self._acquire_flex()
-            if flex is None:
-                self._status("FAIL", "Flex radio not reachable")
+            radio = await self._acquire_radio()
+            if radio is None:
+                self._status("FAIL", "Radio not reachable")
                 return False
 
-            band = await self._resolve_sweep_band(flex, band)
+            band = await self._resolve_sweep_band(radio, band)
             if band is None:
                 return False
 
@@ -285,9 +288,9 @@ class TuneOrchestrator:
                 return False
             raw_total = len(lookup_band(band, in_band_only=False))
 
-            snap = self._snapshot_slice(flex)
+            snap = self._snapshot(radio)
 
-            if not await self._set_tune_mode(flex, snap):
+            if not await self._set_tune_mode(radio, snap):
                 return False
 
             stby = await self._ensure_stby()
@@ -317,7 +320,7 @@ class TuneOrchestrator:
                 self._status("SWEEP_STEP",
                              f"{i}/{total}: {freq_mhz:.4f} MHz")
 
-                ok = await self._run_one_cycle(flex, freq_mhz)
+                ok = await self._run_one_cycle(radio, freq_mhz)
                 if not ok:
                     # _run_one_cycle has already emitted FAIL with the
                     # specific reason — surface a sweep-level summary
@@ -348,22 +351,28 @@ class TuneOrchestrator:
             # Restore the operator's pre-sweep VFO + mode before we
             # release _running. Best effort — log on failure but don't
             # mask whatever terminal phase the sweep produced.
-            if flex is not None and snap is not None:
-                await self._restore_slice(flex, snap)
+            if radio is not None and snap is not None:
+                await self._restore(radio, snap)
             # Hand the amp back to OPERATE last, after the carrier is
             # guaranteed off (per-cycle finally) and the VFO is back.
             if was_operate:
                 await self._restore_operate()
             # Disconnect now the sweep is over (on-demand lifecycle).
-            await self._release_flex()
+            await self._release_radio()
             self._running = False
 
-    async def _run_one_cycle(self, flex: FlexConnection,
+    async def _run_one_cycle(self, radio: RadioConnection,
                              freq_mhz: Optional[float]) -> bool:
         """Single ATU tune cycle. Used by both tune_single (one call)
         and tune_band (called N times in a loop). Caller is responsible
         for setting / clearing self._running around this method.
+
+        Drives the active radio through the generic RadioConnection
+        interface, so the same sequence works for a Flex (SmartSDR) or a
+        SunSDR (TCI) rig.
         """
+        channel = self.radio_controller.channel
+        power = self.radio_controller.tune_power_watts
         carrier_on = False
         success = False
 
@@ -387,20 +396,22 @@ class TuneOrchestrator:
 
             self._status("PREFLIGHT_OK")
 
-            # ----- Optional freq + power setup ----------------------
-            if freq_mhz is not None:
-                try:
-                    await flex.set_slice_freq(self.config.slice_rx, freq_mhz)
-                except FlexProtocolError as e:
-                    self._status("FAIL", f"set_slice_freq: {e}")
-                    return False
-                self._status("FREQ_SET", f"slice {self.config.slice_rx} → "
-                             f"{freq_mhz:.6f} MHz")
-
+            # ----- Freq + mode + power setup ------------------------
             try:
-                await flex.set_tune_power(self.config.tune_power_watts)
-            except FlexProtocolError as e:
-                self._status("FAIL", f"set_tune_power: {e}")
+                if freq_mhz is not None:
+                    await radio.set_frequency(channel, freq_mhz)
+                    self._status("FREQ_SET",
+                                 f"channel {channel} → {freq_mhz:.6f} MHz")
+                # No set_mode here: _set_tune_mode() already put the
+                # channel in CW once, before the sweep loop — repeating
+                # it per sub-band cost a round-trip each (18 on a full
+                # sweep) and defeated its already-CW short-circuit. It
+                # also set a mode _restore couldn't put back in the one
+                # case _set_tune_mode deliberately skips (pre-tune mode
+                # unknown, so nothing to restore).
+                await radio.set_tune_power(power)
+            except Exception as e:
+                self._status("FAIL", f"radio setup: {e}")
                 return False
 
             # ----- Send TUNE keycode, wait for LED ------------------
@@ -417,13 +428,14 @@ class TuneOrchestrator:
 
             # ----- Carrier on, wait for ATU done --------------------
             try:
-                await flex.tune_carrier(on=True)
-            except FlexProtocolError as e:
+                await radio.tune_carrier(on=True)
+            except Exception as e:
                 self._status("FAIL", f"tune_carrier(on): {e}")
                 return False
             carrier_on = True
             self._status("CARRIER_ON",
-                         f"Flex {self.config.tune_power_watts}W")
+                         f"{self.radio_controller.kind} carrier"
+                         + (f" {power}W" if power else ""))
 
             if not await self._wait_for_tune_active(False, TUNE_SWEEP_TIMEOUT):
                 self._status("FAIL", "ATU didn't complete within "
@@ -446,12 +458,11 @@ class TuneOrchestrator:
             # Carrier off MUST run regardless of how we got here —
             # the carrier is the only thing that can hurt antennas /
             # the amp if left on. Tolerate the off failing (best
-            # effort); the FlexConnection's own reconnect will sort
-            # things out and the rig's own watchdog will cut TX
-            # eventually if all else fails.
+            # effort); the radio's own watchdog will cut TX eventually
+            # if all else fails.
             if carrier_on:
                 try:
-                    await flex.tune_carrier(on=False)
+                    await radio.tune_carrier(on=False)
                     self._status("CARRIER_OFF")
                 except Exception:
                     logger.exception("Failed to stop carrier in cleanup")
@@ -460,52 +471,38 @@ class TuneOrchestrator:
             self._status("SUCCESS" if success else "FAIL",
                          "cycle complete" if success else "see prior status")
 
-    def _snapshot_slice(self, flex: FlexConnection) -> Optional[dict]:
-        """Read the current freq+mode of the operator's slice from
-        FlexConnection.slice_state. Returns a small dict the
-        orchestrator can hand to ``_restore_slice`` later, or None if
-        the cache isn't populated yet (e.g. the radio hasn't emitted a
-        slice event since spe-remote connected). Emits ``VFO_SAVED`` on
-        success."""
-        rx = self.config.slice_rx
-        state = flex.slice_state.get(rx)
-        if not state:
+    def _snapshot(self, radio: RadioConnection) -> Optional[dict]:
+        """Capture the operator's current freq+mode via the radio backend
+        so it can be restored after the cycle. Returns an opaque dict for
+        :meth:`_restore`, or None if the backend doesn't know the state
+        yet (restore is then skipped). Emits ``VFO_SAVED``."""
+        channel = self.radio_controller.channel
+        snap = radio.snapshot(channel)
+        if snap is None:
             self._status("VFO_SAVED",
-                         f"slice {rx} state unknown — restore disabled")
-            return None
-        freq = state.get("RF_frequency")
-        mode = state.get("mode")
-        if freq is None and mode is None:
-            self._status("VFO_SAVED",
-                         f"slice {rx} state empty — restore disabled")
+                         f"channel {channel} state unknown — restore disabled")
             return None
         self._status("VFO_SAVED",
-                     f"slice {rx}: {freq} MHz {mode}")
-        return {"rx": rx, "freq": freq, "mode": mode}
+                     f"channel {channel}: {snap.get('freq')} {snap.get('mode')}")
+        return snap
 
-    async def _restore_slice(self, flex: FlexConnection,
-                             snap: Optional[dict]) -> None:
-        """Write the saved freq+mode back to the Flex slice. Best
-        effort — any failure logs at WARN and a FAIL status is emitted,
-        but we never re-raise (the cycle that called us already has
-        its own terminal phase queued)."""
+    async def _restore(self, radio: RadioConnection,
+                       snap: Optional[dict]) -> None:
+        """Write a :meth:`_snapshot` result back via the radio backend.
+        Best effort — never re-raises (the cycle already has its own
+        terminal phase queued)."""
         if snap is None:
             return
-        rx = snap["rx"]
-        freq = snap["freq"]
-        mode = snap["mode"]
         try:
-            if freq is not None:
-                await flex.set_slice_freq(rx, float(freq))
-            if mode is not None:
-                await flex.set_slice_mode(rx, mode)
+            await radio.restore(snap)
             self._status("VFO_RESTORED",
-                         f"slice {rx}: {freq} MHz {mode}")
+                         f"channel {snap.get('channel')}: "
+                         f"{snap.get('freq')} {snap.get('mode')}")
         except Exception as e:
-            logger.exception("Failed to restore slice freq+mode")
+            logger.exception("Failed to restore radio freq+mode")
             self._status("FAIL", f"VFO restore: {e}")
 
-    async def _resolve_sweep_band(self, flex: FlexConnection,
+    async def _resolve_sweep_band(self, radio: RadioConnection,
                                   requested: str) -> Optional[str]:
         """Pick the band to sweep — **the radio rules** (operator's
         design call, 2026-09-02, superseding the first-cut
@@ -523,7 +520,7 @@ class TuneOrchestrator:
         "current" with an unreadable radio FAILs (nothing to sweep).
 
         Returns the band name to sweep, or None after emitting FAIL."""
-        radio_freq = await self._wait_for_slice_freq(flex)
+        radio_freq = await self._wait_for_radio_freq(radio)
         radio_band = (band_for_freq(radio_freq)
                       if radio_freq is not None else None)
         amp_band = self.serial.state.band
@@ -546,10 +543,11 @@ class TuneOrchestrator:
             return radio_band
 
         # Radio band unknown — fall back to the explicit request.
-        why = (f"slice {self.config.slice_rx} at {radio_freq:.4f} MHz "
+        channel = self.radio_controller.channel
+        why = (f"channel {channel} at {radio_freq:.4f} MHz "
                "is outside every ham band"
                if radio_freq is not None else
-               f"slice {self.config.slice_rx} state not available")
+               f"channel {channel} state not available")
         if req in ("", "auto", "current"):
             self._status("FAIL",
                          f"can't derive the band to sweep — {why}; "
@@ -566,50 +564,59 @@ class TuneOrchestrator:
                      f"trusting the requested {key}")
         return key
 
-    async def _set_tune_mode(self, flex: FlexConnection,
+    async def _set_tune_mode(self, radio: RadioConnection,
                              snap: Optional[dict]) -> bool:
-        """Switch the slice to ``TUNE_MODE`` (CW) for the tune so the
+        """Switch the channel to ``TUNE_MODE`` (CW) for the tune so the
         carrier lands exactly on the dial freq — DIGU/DIGL's TX offset
         otherwise shifts it, and near a band edge that puts the
-        carrier out of band, where the Flex refuses to key. Only done
+        carrier out of band, where the rig refuses to key. Only done
         when the pre-tune mode is known (``snap``), since that's what
-        guarantees ``_restore_slice`` can put it back. Returns False
-        after emitting FAIL on a protocol error."""
+        guarantees ``_restore`` can put it back. Returns False after
+        emitting FAIL on a protocol error.
+
+        The generic ``TUNE_MODE`` ("CW") goes through the backend,
+        which maps it to whatever its protocol wants (Flex: CWU)."""
         mode = (snap or {}).get("mode")
+        channel = self.radio_controller.channel
         if mode is None:
             self._status("MODE_SET",
-                         "slice mode unknown — leaving it untouched")
+                         "radio mode unknown — leaving it untouched")
             return True
-        if str(mode).upper() == TUNE_MODE:
+        # Backends report their native sub-mode (a Flex says "CWU"), so
+        # match the family rather than the exact generic name.
+        if str(mode).upper().startswith(TUNE_MODE):
             return True  # already CW; nothing to change
         try:
-            await flex.set_slice_mode(self.config.slice_rx, TUNE_MODE)
-        except FlexProtocolError as e:
-            self._status("FAIL", f"set_slice_mode({TUNE_MODE}): {e}")
+            await radio.set_mode(channel, TUNE_MODE)
+        except Exception as e:
+            self._status("FAIL", f"set_mode({TUNE_MODE}): {e}")
             return False
         self._status("MODE_SET",
-                     f"slice {self.config.slice_rx} → {TUNE_MODE} for the "
+                     f"channel {channel} → {TUNE_MODE} for the "
                      f"tune (was {mode}, restored after — DIGU/DIGL TX "
                      "offset would shift the carrier past a band edge)")
         return True
 
-    async def _wait_for_slice_freq(self, flex: FlexConnection
+    async def _wait_for_radio_freq(self, radio: RadioConnection
                                    ) -> Optional[float]:
-        """Return the operator slice's current freq (MHz), waiting up
-        to SLICE_STATE_TIMEOUT for the post-connect ``sub slice all``
-        events to populate the cache. None if it never shows up (or
-        doesn't parse) — callers treat that as 'radio band unknown'."""
+        """Return the operator channel's current freq (MHz), waiting up
+        to RADIO_STATE_TIMEOUT for the backend's own event stream to
+        populate its state cache (a Flex's post-connect ``sub slice
+        all`` events, TCI's startup dump). None if it never shows up
+        (or doesn't parse) — callers treat that as 'radio band
+        unknown'."""
+        channel = self.radio_controller.channel
         loop = asyncio.get_event_loop()
-        deadline = loop.time() + SLICE_STATE_TIMEOUT
+        deadline = loop.time() + RADIO_STATE_TIMEOUT
         while loop.time() < deadline:
             if self._stop_requested.is_set():
                 return None
-            state = flex.slice_state.get(self.config.slice_rx)
-            freq = state.get("RF_frequency") if state else None
+            snap = radio.snapshot(channel)
+            freq = snap.get("freq") if snap else None
             if freq is not None:
                 try:
                     return float(freq)
-                except ValueError:
+                except (TypeError, ValueError):
                     return None
             await asyncio.sleep(_POLL_INTERVAL)
         return None

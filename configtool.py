@@ -14,8 +14,15 @@ Usage:
   configtool.py preview <section.key=value> ...     # show a unified diff, no write
   configtool.py write   <section.key=value> ...     # apply the changes
 
-Supported keys: serial.port, server.port, flex.enabled, flex.host,
-flex.port, flex.slice_rx, flex.tune_power_watts.
+Supported keys:
+  serial.port, server.port
+  radio.kind                                      # flex | tci | none
+  flex.enabled, flex.host, flex.port, flex.slice_rx, flex.tune_power_watts
+  tci.host, tci.port, tci.trx, tci.mode, tci.tune_drive
+
+A key whose section (or whose section's key) is missing from an older
+config.yaml is added rather than dropped — that's the Pi upgrade path,
+where a pre-radio config has no radio:/tci: block at all.
 """
 import sys
 import re
@@ -52,39 +59,81 @@ def _fmt_qstr(v):
 SUPPORTED = {
     ("serial", "port"): _fmt_plain,
     ("server", "port"): _fmt_int,
+    ("radio", "kind"): _fmt_plain,
     ("flex", "enabled"): _fmt_bool,
     ("flex", "host"): _fmt_qstr,
     ("flex", "port"): _fmt_int,
     ("flex", "slice_rx"): _fmt_int,
     ("flex", "tune_power_watts"): _fmt_int,
+    ("tci", "host"): _fmt_qstr,
+    ("tci", "port"): _fmt_int,
+    ("tci", "trx"): _fmt_int,
+    ("tci", "mode"): _fmt_plain,
+    ("tci", "tune_drive"): _fmt_int,
 }
 
-FLEX_DEFAULTS = {
-    "enabled": "false",
-    "host": '""',
-    "port": "4992",
-    "slice_rx": "0",
-    "tune_power_watts": "10",
-}
-
-
-def _flex_block(values):
-    """Render a fresh ``flex:`` block from ``values`` (already-formatted tokens)."""
-    return (
+# Sections this tool can synthesise from scratch when config.yaml
+# predates them — the Pi upgrade path, where an older file has no
+# radio:/tci: block at all and a write to one would otherwise be dropped
+# silently (leaving spe-remote on the wrong backend, with no diagnostic).
+# Each entry is the block's leading comment plus its keys in render
+# order, with a default token and an inline comment; keys being written
+# override the defaults.
+SECTION_TEMPLATES = {
+    "radio": (
+        "# Which rig spe-remote drives for orchestrated TUNE / band sweep.\n"
+        "# Clients can also change this at runtime over the WebSocket.\n",
+        [
+            ("kind", "none", "   # flex | tci | none"),
+        ],
+    ),
+    "flex": (
         "# Optional FlexRadio 6000-series control for orchestrated TUNE + band\n"
         "# sweep. Leave enabled: false to run spe-remote exactly as before.\n"
         "# When enabled, spe-remote opens a second connection (SmartSDR TCP API)\n"
-        "# and exposes the tune_single / tune_band / tune_stop WS commands.\n"
-        "flex:\n"
-        "  enabled: {enabled}\n"
-        '  host: {host}   # Static LAN IP of the Flex; leave empty ("") to auto-discover\n'
-        "  port: {port}              # SmartSDR TCP control port\n"
-        "  slice_rx: {slice_rx}             # Which slice to drive during tune cycles\n"
-        "  tune_power_watts: {tune_power_watts}    # Carrier power for ATU tunes; SPE wants 2-15W\n"
-    ).format(**values)
+        "# and exposes the tune_single / tune_band / tune_stop WS commands.\n",
+        [
+            ("enabled", "false", ""),
+            ("host", '""', '   # Static LAN IP of the Flex; leave empty ("") to auto-discover'),
+            ("port", "4992", "              # SmartSDR TCP control port"),
+            ("slice_rx", "0", "             # Which slice to drive during tune cycles"),
+            ("tune_power_watts", "10", "    # Carrier power for ATU tunes; SPE wants 2-15W"),
+        ],
+    ),
+    "tci": (
+        "# Expert Electronics SunSDR / ExpertSDR3 control over TCI — the other\n"
+        "# tune backend. Used when radio.kind is tci; the WebSocket protocol\n"
+        "# ExpertSDR3 speaks, default port 50001.\n",
+        [
+            ("host", '"127.0.0.1"', "   # ExpertSDR3 / SunSDR TCI host"),
+            ("port", "50001", "        # TCI WebSocket port"),
+            ("trx", "0", "             # Which TRX/receiver to drive (0 or 1)"),
+            ("mode", "CW", "            # Mode set on the tuned TRX"),
+            ("tune_drive", "0", "      # Tune-power percent; 0 = leave it to ExpertSDR"),
+        ],
+    ),
+}
+
+
+def _render_section(section, values):
+    """Render a fresh ``section:`` block as a list of lines. ``values``
+    maps key -> already-formatted token and overrides the defaults. A
+    section with no template gets a bare header plus the keys written."""
+    header, keys = SECTION_TEMPLATES.get(section, ("", []))
+    lines = header.rstrip("\n").split("\n") if header else []
+    lines.append("%s:" % section)
+    written = set()
+    for key, default, comment in keys:
+        lines.append("  %s: %s%s" % (key, values.get(key, default), comment))
+        written.add(key)
+    for key, formatted in values.items():
+        if key not in written:
+            lines.append("  %s: %s" % (key, formatted))
+    return lines
 
 
 _SECTION_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(#.*)?$")
+_ANY_KEY_RE = re.compile(r"^(\s+)([A-Za-z0-9_]+)(\s*:\s*)(.*?)(\s+#.*)?\s*$")
 
 
 def _set_one(lines, section, key, formatted):
@@ -114,42 +163,72 @@ def _set_one(lines, section, key, formatted):
 
 
 def _has_section(text, section):
-    return bool(re.search(r"^%s:\s*$" % re.escape(section), text, re.MULTILINE))
+    return bool(re.search(r"^%s:\s*(#.*)?$" % re.escape(section),
+                          text, re.MULTILINE))
+
+
+def _insert_key(lines, section, key, formatted):
+    """Add ``key`` to an existing ``section`` that doesn't have it yet
+    (e.g. a tci: block written by an older build with no tune_drive:).
+
+    Goes after the section's *last* existing key, not straight after the
+    header — the header's explanatory comments sit in between, and new
+    keys belong below them."""
+    at, cur = None, None
+    for i, line in enumerate(lines):
+        m = _SECTION_RE.match(line)
+        if m:
+            if cur == section:
+                break              # next section: stop at what we had
+            cur = m.group(1)
+            if cur == section:
+                at = i + 1
+            continue
+        if cur == section and _ANY_KEY_RE.match(line):
+            at = i + 1
+    if at is None:                 # section vanished between checks
+        return lines
+    return lines[:at] + ["  %s: %s" % (key, formatted)] + lines[at:]
 
 
 def _apply(text, changes):
     """Return ``text`` with all ``changes`` (dict of (section,key)->raw) applied."""
     lines = text.split("\n")
-    flex_pending = {}
+    pending = {}
     for (section, key), raw in changes.items():
-        fmt = SUPPORTED[(section, key)]
-        formatted = fmt(raw)
-        if section == "flex" and not _has_section("\n".join(lines), "flex"):
-            # Collect flex keys; the block gets inserted once, below.
-            flex_pending[key] = formatted
+        formatted = SUPPORTED[(section, key)](raw)
+        if not _has_section("\n".join(lines), section):
+            # Whole section missing: collect its keys, synthesise once below.
+            pending.setdefault(section, {})[key] = formatted
             continue
         lines, found = _set_one(lines, section, key, formatted)
-        if not found and section == "flex":
-            flex_pending[key] = formatted
+        if not found:
+            lines = _insert_key(lines, section, key, formatted)
 
-    if flex_pending:
-        values = dict(FLEX_DEFAULTS)
-        values.update(flex_pending)
-        block = _flex_block(values).rstrip("\n").split("\n")
-        # Insert just above the logging: section if present, else append.
-        insert_at = None
-        for i, line in enumerate(lines):
-            if re.match(r"^logging:\s*$", line):
-                insert_at = i
-                break
-        if insert_at is None:
-            if lines and lines[-1].strip() != "":
-                lines.append("")
-            lines.extend(block)
-        else:
-            lines[insert_at:insert_at] = block + [""]
+    # Templated sections first, in template order, so a config gaining
+    # both radio: and tci: gets them in the documented order.
+    ordered = ([s for s in SECTION_TEMPLATES if s in pending]
+               + [s for s in pending if s not in SECTION_TEMPLATES])
+    for section in ordered:
+        lines = _insert_block(lines, _render_section(section, pending[section]))
 
     return "\n".join(lines)
+
+
+def _insert_block(lines, block):
+    """Put a synthesised section just above ``logging:`` (the file ends
+    with it, and radio blocks read better next to the other settings),
+    or append it."""
+    insert_at = None
+    for i, line in enumerate(lines):
+        if re.match(r"^logging:\s*(#.*)?$", line):
+            insert_at = i
+            break
+    if insert_at is None:
+        if lines and lines[-1].strip() != "":
+            lines.append("")
+        return lines + block
+    return lines[:insert_at] + block + [""] + lines[insert_at:]
 
 
 def _parse_changes(args):
