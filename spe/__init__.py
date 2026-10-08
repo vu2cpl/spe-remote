@@ -4,4 +4,4 @@
 # (spe/update_check.py) compares this against the latest release tag, so
 # it MUST be bumped in the release commit every time a vX.Y.Z tag is cut —
 # otherwise every install keeps reporting the new release as available.
-__version__ = "3.0.0"
+__version__ = "3.0.1"
