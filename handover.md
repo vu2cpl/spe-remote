@@ -4,7 +4,8 @@
 **Branch:** `main`, clean, in sync with `origin/main`
 **Latest release:** `v3.0.1` — SunSDR/TCI tune, safer band sweep, new-release check (2026-10-09; see Releases). **Every release must bump `__version__` in `spe/__init__.py`** (the update check compares it with the tag) — see Deployment → Release checklist.
 **Unreleased on main:** nothing — main = v3.0.1 plus handover-only commits.
-**Last commit:** the v3.0.1 release commit (`__version__` 3.0.1, guide PDF, this file) and its deploy record. Before it: `e44eadc` update-check follow-up, `584fdea` the check itself, `5f106df` multi-radio tune (PR #4, Recent work 2).
+**Pi (noderedpi4):** still runs `c494407` — the v3.0.1 deploy was held back on 2026-10-09 because the amp was in OPERATE (see Releases). Deploy pending.
+**Last commit:** the v3.0.1 release commit `1271287` (`__version__` 3.0.1, guide PDF, this file) and the deploy-held-back note. Before it: `e44eadc` update-check follow-up, `584fdea` the check itself, `5f106df` multi-radio tune (PR #4, Recent work 2).
 **Date:** 2026-10-09
 
 ## What this project is
@@ -39,6 +40,7 @@ docs/                  protocol notes, Node-RED sample flow
 ## Releases
 
 - **v3.0.1 (2026-10-09)** — tag on the release commit (the one that bumps `__version__` to `3.0.1`); https://github.com/vu2cpl/spe-remote/releases/tag/v3.0.1 — no assets (like v3.0.0). Manoj approved it as the next *patch* version, although the content since v3.0.0 is feature-sized: the new-release check + banner (Recent work 1), multi-radio SunSDR/TCI tune + client-selected radio config (PR #4, Recent work 2), tune in CW (3), radio-rules sweep band (4), sweep auto-STBY / band check / OPERATE restore (5), Flex on-demand connect (PR #3, 7), p_out AVG/PEAK (8), the in-repo `tests/`. Release commit: `__version__ = "3.0.1"`, guide Version row `3.0.1 (multi-radio tune + new-release check)` + PDF regenerated with reportlab 5.0.1 (Homebrew python3), all six `tests/test_*.py` ALL PASS before and after the bump. No `requirements.txt` or systemd-unit change since v3.0.0 → notes say `git pull --ff-only && sudo systemctl restart spe-remote` is the whole upgrade. Credits in the notes: OH2GEK (original), Vinod VU3ESV/LB9KJ (PR #3, PR #4), SM5TOG's sm5k-spe-tuner (TCI reference).
+  - **Pi deploy NOT done (2026-10-09 05:11 IST) — amp was in OPERATE.** Pre-restart check on noderedpi4 (`vu2cpl@192.168.1.169`, `/home/vu2cpl/spe-remote`), read-only: a listen-only WebSocket client (venv tornado, sent nothing) got `op_status: Oper`, `tx_status: RX`, 80m, `p_out 0000`, no warnings/errors, `tune_active: false`, 1.5K-FA, `serial: up`, one other client (Node-RED on 127.0.0.1), and the journal showed that client sending `power_level` three times at 04:59:59–05:00:03 — someone was operating. So no `git pull`, no restart. The Pi clone is clean, on `main` at `c494407` (pre-update-check), service active since 2026-10-08 11:04 IST (PID 1927). To deploy when the amp is in STANDBY/off and nobody is on the air: `ssh vu2cpl@192.168.1.169`, `cd /home/vu2cpl/spe-remote && git pull --ff-only && sudo systemctl restart spe-remote`, then `systemctl is-active spe-remote`, `journalctl -u spe-remote -n 30 --no-pager` (expect `Update check` start + serial reconnect), `curl -s http://127.0.0.1:8888/api/update` (`current` 3.0.1). No `setup.sh` / `install-service.sh` needed (no requirements/unit change).
 - **v3.0.0 (2026-06-20)** — first tagged release, see Recent work 9.
 
 ## Recent work (newest first)
@@ -143,6 +145,7 @@ systemd unit `spe-remote.service` runs the server as a daemon. `install-service.
 
 ## Open threads / ideas (not started)
 
+- **Deploy v3.0.1 to noderedpi4** — held back 2026-10-09 05:11 IST (amp in OPERATE, Node-RED sending commands). Do it when the amp is in STANDBY/off: steps in Releases → v3.0.1.
 - **New-release check follow-up:** show the same notice in MacExpert by polling `/api/update` (not started; MacExpert is its own repo). The check itself shipped in v3.0.1.
 - **User guide PDF lags the code:** `docs/generate_guide.py` still describes Flex-only tuning — SunSDR/TCI, the RADIO settings panel, the auto-STBY/OPERATE-restore sweep and `/api/update` are not in the guide (v3.0.1 only bumped its Version row, per the checklist).
 - No formal test suite for the amp / serial path. The tune orchestrator + Flex/TCI backends + configtool upgrade path + WS radio config *do* have one now (`tests/test_*.py`, no hardware / no `pyyaml` / no `tornado`, run with `python3 tests/<file>.py`). Everything else has still been tested against a live amp.
