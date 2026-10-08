@@ -1,11 +1,23 @@
 """Tell the operator when a newer spe-remote release is out on GitHub.
 
-Shortly after start, and then once every 24 h, ask the GitHub releases
-API for the latest spe-remote release and compare its tag with
-:data:`spe.__version__`. A newer release is logged once and cached for
-the bundled dashboard, which reads it from ``GET /api/update`` (see
-spe/app.py) and shows a small "new version available" banner. On by
-default; ``updates.check: false`` in config.yaml turns it off.
+About a minute after start, ask the GitHub releases API for the latest
+spe-remote release and compare its tag with :data:`spe.__version__`. A
+newer release is logged once and cached for the bundled dashboard, which
+reads it from ``GET /api/update`` (see spe/app.py) and shows a small
+"new version available" banner. On by default; ``updates.check: false``
+in config.yaml turns it off.
+
+Schedule (Manoj, 2026-10-09):
+
+- Only a *successful* check — HTTP 200 and a JSON object with a usable
+  ``tag_name``, newer or not — records the check time (``checked_at``)
+  and sets the next check 24 h later.
+- A failed check (offline, timeout, any HTTP error incl. 403 rate limit,
+  bad JSON) records nothing and is retried 1 h later, so an outage at
+  check time costs an hour, not a day. All of this is in memory; a
+  restart checks again about a minute after start.
+- A development version (``__version__`` containing "dev", any case)
+  never checks automatically. The test hook below is not affected.
 
 Rules this module keeps:
 
@@ -16,7 +28,7 @@ Rules this module keeps:
   amplifier control path; the HTTP handler only reads a cached snapshot.
 - Silent on failure (offline, 403 rate limit, bad JSON): one DEBUG line.
 - Never downloads or installs anything. Updating stays the operator's
-  manual ``git pull`` + reinstall (``UPDATE_COMMAND``).
+  manual ``git pull`` + service restart (``UPDATE_COMMAND``).
 
 Test hook (inert unless set): ``SPE_REMOTE_UPDATE_TEST_VERSION=0.0.1``
 makes the checker compare as if that version were running, so the
@@ -41,9 +53,12 @@ API_URL = "https://api.github.com/repos/%s/releases/latest" % REPO
 RELEASES_URL = "https://github.com/%s/releases" % REPO
 TIMEOUT_S = 10
 FIRST_CHECK_DELAY_S = 60.0          # "shortly after start"
-CHECK_INTERVAL_S = 24 * 3600.0      # then at most once a day
+CHECK_INTERVAL_S = 24 * 3600.0      # next check 24 h after a successful one
+RETRY_AFTER_FAILURE_S = 3600.0      # ...or 1 h after a failed one
 # The documented update path (README "Updating"), run in the clone.
-UPDATE_COMMAND = "git pull && ./setup.sh && sudo ./install-service.sh"
+# ./setup.sh is only needed when a release changes requirements.txt (the
+# release notes say so); the banner shows the everyday command.
+UPDATE_COMMAND = "git pull --ff-only && sudo systemctl restart spe-remote"
 TEST_VERSION_ENV = "SPE_REMOTE_UPDATE_TEST_VERSION"
 
 
@@ -65,14 +80,28 @@ def is_newer(latest, current) -> bool:
     return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
 
 
-def fetch_latest_release(timeout: float = TIMEOUT_S) -> dict:
-    """GET the latest release JSON. Raises on any network/HTTP/JSON error."""
+def is_dev_version(version) -> bool:
+    """True for a development version (contains "dev", any case), e.g.
+    ``3.1.0.dev0`` — those never check automatically."""
+    return "dev" in str(version or "").lower()
+
+
+def fetch_latest_release(timeout: float = TIMEOUT_S,
+                         opener: Optional[Callable] = None) -> dict:
+    """GET the latest release JSON. Raises on any network/HTTP/JSON error,
+    including any status other than 200 and JSON that is not an object."""
     req = urllib.request.Request(API_URL, headers={
         "Accept": "application/vnd.github+json",
         "User-Agent": "spe-remote/%s" % __version__,
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read(1 << 20).decode("utf-8"))
+    with (opener or urllib.request.urlopen)(req, timeout=timeout) as resp:
+        status = getattr(resp, "status", 200)
+        if status != 200:
+            raise ValueError("HTTP %s" % status)
+        data = json.loads(resp.read(1 << 20).decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("release JSON is not an object")
+    return data
 
 
 class UpdateChecker:
@@ -82,14 +111,19 @@ class UpdateChecker:
                  current_version: Optional[str] = None,
                  fetch: Callable[[], dict] = fetch_latest_release,
                  first_delay: float = FIRST_CHECK_DELAY_S,
-                 interval: float = CHECK_INTERVAL_S) -> None:
+                 interval: float = CHECK_INTERVAL_S,
+                 retry_delay: float = RETRY_AFTER_FAILURE_S) -> None:
         test_version = os.environ.get(TEST_VERSION_ENV, "").strip()
         self.test_override = bool(test_version) and current_version is None
         self.current_version = current_version or test_version or __version__
         self.enabled = bool(enabled)
+        # A dev version never checks by itself; the test hook still does.
+        self.dev_skip = (not self.test_override
+                         and is_dev_version(self.current_version))
         self._fetch = fetch
         self._first_delay = first_delay
         self._interval = interval
+        self._retry_delay = retry_delay
         self._lock = threading.Lock()
         self._latest: Optional[dict] = None     # set only when newer
         self._checked_at: Optional[float] = None
@@ -102,14 +136,20 @@ class UpdateChecker:
         if not self.enabled:
             logger.info("Update check off (updates.check: false)")
             return
+        if self.dev_skip:
+            logger.info("Update check skipped: %s is a development version "
+                        "(%s=<version> still checks)",
+                        self.current_version, TEST_VERSION_ENV)
+            return
         if self._thread is not None:
             return
         if self.test_override:
             logger.info("Update check: %s=%s — comparing as if that version "
                         "were running", TEST_VERSION_ENV, self.current_version)
         logger.info("Update check on: GitHub %s releases, first in %.0f s, "
-                    "then every %.0f h", REPO, self._first_delay,
-                    self._interval / 3600.0)
+                    "then %.0f h after each successful check (%.0f min "
+                    "after a failed one)", REPO, self._first_delay,
+                    self._interval / 3600.0, self._retry_delay / 60.0)
         self._thread = threading.Thread(
             target=self._run, name="update-check", daemon=True)
         self._thread.start()
@@ -118,16 +158,27 @@ class UpdateChecker:
         self._stop.set()
 
     def _run(self) -> None:
+        # 24 h after a successful check, 1 h after a failed one. Nothing is
+        # persisted: a restart starts over with the ~60 s first check.
         delay = self._first_delay
         while not self._stop.wait(delay):
-            self.check_once()
-            delay = self._interval
+            delay = self._interval if self._check() else self._retry_delay
 
     def check_once(self) -> bool:
         """Run one check now. Returns True when a newer release is known.
         Never raises; a failed check keeps the previous result."""
+        self._check()
+        with self._lock:
+            return self._latest is not None
+
+    def _check(self) -> bool:
+        """One request. True on success (HTTP 200 + a usable ``tag_name``,
+        newer or not) — the only case that records ``checked_at``. A
+        failure records nothing and keeps the previous result."""
         try:
             data = self._fetch()
+            if not isinstance(data, dict):
+                raise ValueError("release JSON is not an object")
             tag = data.get("tag_name")
             if not isinstance(tag, str) or not parse_version(tag):
                 raise ValueError("no usable tag_name (%r)" % (tag,))
@@ -136,9 +187,9 @@ class UpdateChecker:
             if not isinstance(url, str) or not url.startswith(RELEASES_URL + "/"):
                 url = RELEASES_URL
         except Exception as e:  # offline, 403/rate limit, bad JSON, ...
-            logger.debug("Update check failed (ignored): %s", e)
-            with self._lock:
-                return self._latest is not None
+            logger.debug("Update check failed (ignored, retry in %.0f min): %s",
+                         self._retry_delay / 60.0, e)
+            return False
 
         newer = is_newer(tag, self.current_version)
         with self._lock:
@@ -152,7 +203,7 @@ class UpdateChecker:
         elif not newer:
             logger.debug("Update check: running %s, latest release %s",
                          self.current_version, tag)
-        return newer
+        return True
 
     def status(self) -> dict:
         """Snapshot for ``GET /api/update``. Cheap; never does I/O."""

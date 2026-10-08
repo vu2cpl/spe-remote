@@ -23,7 +23,7 @@ A modern Python 3 remote control server for **SPE Expert** HF amplifiers (1.3K-F
 - **Graceful shutdown** — SIGINT/SIGTERM handler cancels tasks and closes the port cleanly
 - **Configurable** — YAML config file for serial port, baud rate, polling intervals
 - **Guided setup** — `./configure.sh` lists the Pi's `/dev/serial/by-id/` ports to pick from, walks you through the optional Flex radio, and keeps your saved settings on re-run; `sudo ./install-service.sh --update` re-configures and restarts the live service with a diff preview
-- **New-release notice** — shortly after start and then once a day the server asks GitHub whether a newer spe-remote release is out; if so, the dashboard shows a small banner with the release-notes link and the update command, and the log gets one line. One anonymous request, on its own thread, never on the amp control path, and it never updates anything itself (`updates.check: false` turns it off) — see [Updating](#7-updating)
+- **New-release notice** — shortly after start and then once a day (an hour later if GitHub couldn't be reached) the server asks GitHub whether a newer spe-remote release is out; if so, the dashboard shows a small banner with the release-notes link and the update command, and the log gets one line. One anonymous request, on its own thread, never on the amp control path, and it never updates anything itself (`updates.check: false` turns it off) — see [Updating](#7-updating)
 
 ## How It Works — One Server, Many Clients
 
@@ -239,19 +239,21 @@ This is the bundled dashboard. To also drive the amp from Node-RED on the same P
 
 ### 7. Updating
 
-spe-remote tells you when there is something to update to. About a minute after it starts, and then once a day, it asks GitHub for the latest [release](https://github.com/vu2cpl/spe-remote/releases); when that is newer than the running version, the dashboard shows a banner — *"spe-remote vX.Y.Z is available — release notes"* plus the update command — and the log (`journalctl -u spe-remote`) gets one line. It is a single anonymous request to `api.github.com` (no token, nothing about your station is sent), it runs on its own background thread so it can never hold up the amp, and failures (offline, rate-limited) are silently ignored. It **never** downloads or installs anything.
+spe-remote tells you when there is something to update to. About a minute after it starts, and then once a day, it asks GitHub for the latest [release](https://github.com/vu2cpl/spe-remote/releases); when that is newer than the running version, the dashboard shows a banner — *"spe-remote vX.Y.Z is available — release notes"* plus the update command — and the log (`journalctl -u spe-remote`) gets one line. It is a single anonymous request to `api.github.com` (no token, nothing about your station is sent), it runs on its own background thread so it can never hold up the amp, and failures (offline, rate-limited, a GitHub error) are silently ignored and retried an hour later — the once-a-day clock only restarts after a check that got an answer. It **never** downloads or installs anything. A development version (one with `dev` in its version number) does not check by itself.
 
 To update, in the spe-remote folder on the Pi:
 
 ```bash
-git pull && ./setup.sh && sudo ./install-service.sh
+git pull --ff-only && sudo systemctl restart spe-remote
 ```
 
-`git pull` fetches the new code, `./setup.sh` installs any new Python dependencies (it keeps your configuration), and `install-service.sh` restarts the service on the new code. Your `config.yaml` settings carry over.
+`git pull --ff-only` fetches the new code (and stops rather than merging if your clone has commits of its own), and the restart puts the running service on it. Your `config.yaml` settings carry over.
 
-> If `git pull` stops with *"Your local changes to … config.yaml would be overwritten"* (the dashboard writes the °C/°F and radio settings back into that file), use `git stash && git pull && git stash pop` for the first step.
+Only if a release changes the Python dependencies (`requirements.txt` — the release notes say so) run `./setup.sh` before the restart; it installs them and keeps your configuration. Likewise `sudo ./install-service.sh` is only needed when a release changes the systemd unit (it restarts the service itself).
 
-To turn the check off, set `updates.check: false` in `config.yaml` and restart. For testing, starting the server with `SPE_REMOTE_UPDATE_TEST_VERSION=0.0.1` makes it compare as if 0.0.1 were running, so the banner shows against the current release.
+> If `git pull` stops with *"Your local changes to … config.yaml would be overwritten"* (the dashboard writes the °C/°F and radio settings back into that file), use `git stash && git pull --ff-only && git stash pop` for the first step.
+
+To turn the check off, set `updates.check: false` in `config.yaml` and restart. For testing, starting the server with `SPE_REMOTE_UPDATE_TEST_VERSION=0.0.1` makes it compare as if 0.0.1 were running, so the banner shows against the current release (this works on a development version too).
 
 ## Orchestrated TUNE and Band Sweep
 
@@ -706,12 +708,12 @@ The dashboard's new-release banner reads the server's cached release check from 
   "update_available": true,
   "latest": "v3.1.0",
   "html_url": "https://github.com/vu2cpl/spe-remote/releases/tag/v3.1.0",
-  "update_command": "git pull && ./setup.sh && sudo ./install-service.sh",
+  "update_command": "git pull --ff-only && sudo systemctl restart spe-remote",
   "checked_at": 1791481827.7
 }
 ```
 
-`update_available` stays `false` (and `latest` / `html_url` `null`) until a check finds a newer release; the first check runs about a minute after start. Other clients (MacExpert, Node-RED) can poll it the same way. No auth — LAN-only, like the WebSocket.
+`update_available` stays `false` (and `latest` / `html_url` `null`) until a check finds a newer release; the first check runs about a minute after start. `checked_at` is the time of the last *successful* check (`null` until one succeeds); a failed check changes nothing here and is retried an hour later. Other clients (MacExpert, Node-RED) can poll it the same way. No auth — LAN-only, like the WebSocket.
 
 ## Troubleshooting
 
@@ -728,7 +730,7 @@ The dashboard's new-release banner reads the server's cached release check from 
 | RCU frames never arrive | Check the companion client actually reads binary WebSocket messages; the browser dashboard doesn't |
 | Server doesn't exit on Ctrl+C | Should never happen with the new shutdown handler — if it does, check for a hung serial read and file an issue |
 | MacExpert can't send commands | Verify `wsCommandName` enum in Swift matches `COMMANDS` keys in `spe/protocol.py` |
-| New-release banner never shows | It only appears when GitHub has a release newer than the running version. Check `updates.check` isn't `false`, `curl http://<pi>:8888/api/update`, and set `logging.level: DEBUG` to see the `Update check` lines (a failed check is only logged at DEBUG) |
+| New-release banner never shows | It only appears when GitHub has a release newer than the running version. Check `updates.check` isn't `false` and the version has no `dev` in it (development versions never check by themselves), `curl http://<pi>:8888/api/update`, and set `logging.level: DEBUG` to see the `Update check` lines (a failed check is only logged at DEBUG, and retried an hour later) |
 
 ## Credits
 
