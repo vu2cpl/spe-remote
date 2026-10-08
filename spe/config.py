@@ -94,6 +94,18 @@ class AmpConfig:
 
 
 @dataclass
+class UpdatesConfig:
+    """GitHub release update check (spe/update_check.py).
+
+    When ``check`` is on (the default) the server asks the GitHub API for
+    the latest spe-remote release shortly after start and then once a day,
+    and the dashboard shows a banner when a newer one is out. It never
+    updates anything by itself.
+    """
+    check: bool = True
+
+
+@dataclass
 class AppConfig:
     serial: SerialConfig = field(default_factory=SerialConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
@@ -102,6 +114,7 @@ class AppConfig:
     flex: FlexConfig = field(default_factory=FlexConfig)
     tci: TciConfig = field(default_factory=TciConfig)
     radio: RadioConfig = field(default_factory=RadioConfig)
+    updates: UpdatesConfig = field(default_factory=UpdatesConfig)
     log_level: str = "INFO"
 
 
@@ -250,6 +263,21 @@ def persist_values(changes: dict, path: str = "config.yaml") -> bool:
         return False
 
 
+def _as_bool(value, default: bool) -> bool:
+    """YAML booleans pass through; quoted "false"/"off"/"no"/"0" and
+    friends are honoured too; anything unrecognised keeps ``default``."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("false", "no", "off", "0"):
+        return False
+    if s in ("true", "yes", "on", "1"):
+        return True
+    return default
+
+
 def load_config(path: str = "config.yaml") -> AppConfig:
     config = AppConfig()
     config_path = Path(path)
@@ -302,6 +330,10 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         if config.radio.kind not in ("flex", "tci", "none"):
             logger.warning(f"Unknown radio.kind {config.radio.kind!r}; using 'none'")
             config.radio.kind = "none"
+
+        if isinstance(raw.get("updates"), dict):
+            config.updates.check = _as_bool(
+                raw["updates"].get("check", True), default=True)
 
         if "logging" in raw:
             config.log_level = raw["logging"].get("level", "INFO")

@@ -29,9 +29,28 @@ class NoCacheStaticFileHandler(tornado.web.StaticFileHandler):
         self.set_header("Cache-Control", "no-cache, must-revalidate")
 
 
-def make_app() -> tornado.web.Application:
+class UpdateStatusHandler(tornado.web.RequestHandler):
+    """``GET /api/update`` — the cached result of the GitHub release check
+    (spe/update_check.py), read by the dashboard's update banner.
+
+    Only reads a snapshot; the check itself runs on its own thread, so a
+    slow or offline GitHub can never hold up this request or the WS."""
+
+    def initialize(self, checker=None) -> None:
+        self._checker = checker
+
+    def get(self) -> None:
+        self.set_header("Cache-Control", "no-store")
+        if self._checker is None:
+            self.write({"enabled": False, "update_available": False})
+        else:
+            self.write(self._checker.status())
+
+
+def make_app(update_checker=None) -> tornado.web.Application:
     return tornado.web.Application([
         (r"/ws", AmplifierWebSocket),
+        (r"/api/update", UpdateStatusHandler, {"checker": update_checker}),
         (r"/(.*)", NoCacheStaticFileHandler, {
             "path": WEB_DIR,
             "default_filename": "index.html",

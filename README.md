@@ -23,6 +23,7 @@ A modern Python 3 remote control server for **SPE Expert** HF amplifiers (1.3K-F
 - **Graceful shutdown** — SIGINT/SIGTERM handler cancels tasks and closes the port cleanly
 - **Configurable** — YAML config file for serial port, baud rate, polling intervals
 - **Guided setup** — `./configure.sh` lists the Pi's `/dev/serial/by-id/` ports to pick from, walks you through the optional Flex radio, and keeps your saved settings on re-run; `sudo ./install-service.sh --update` re-configures and restarts the live service with a diff preview
+- **New-release notice** — shortly after start and then once a day the server asks GitHub whether a newer spe-remote release is out; if so, the dashboard shows a small banner with the release-notes link and the update command, and the log gets one line. One anonymous request, on its own thread, never on the amp control path, and it never updates anything itself (`updates.check: false` turns it off) — see [Updating](#7-updating)
 
 ## How It Works — One Server, Many Clients
 
@@ -76,6 +77,7 @@ The web client displays:
 - Band, antenna, input, and power level information
 - Warning and error alerts from the amplifier
 - Control buttons: Operate, ANT, TUNE, INPUT, POWER, BAND +/−
+- A **new-release banner** under the status line when GitHub has a newer spe-remote release than the one running (see [Updating](#7-updating))
 
 ## Requirements
 
@@ -159,6 +161,10 @@ flex:
   slice_rx: 0             # Which slice to drive during tune cycles
   tune_power_watts: 10    # Carrier power for ATU sweeps (5–15 W typical)
 
+# Optional — the daily new-release check is ON when this section is absent.
+updates:
+  check: true             # ask GitHub once a day for a newer release (dashboard banner); never auto-updates
+
 logging:
   level: INFO
 ```
@@ -230,6 +236,22 @@ nohup ./run.sh &
 Navigate to `http://<your-pi-ip>:8888/` in any browser.
 
 This is the bundled dashboard. To also drive the amp from Node-RED on the same Pi or from MacExpert on your Mac, see the [How It Works](#how-it-works--one-server-many-clients) diagram above and the [Node-RED Integration](#node-red-integration) section.
+
+### 7. Updating
+
+spe-remote tells you when there is something to update to. About a minute after it starts, and then once a day, it asks GitHub for the latest [release](https://github.com/vu2cpl/spe-remote/releases); when that is newer than the running version, the dashboard shows a banner — *"spe-remote vX.Y.Z is available — release notes"* plus the update command — and the log (`journalctl -u spe-remote`) gets one line. It is a single anonymous request to `api.github.com` (no token, nothing about your station is sent), it runs on its own background thread so it can never hold up the amp, and failures (offline, rate-limited) are silently ignored. It **never** downloads or installs anything.
+
+To update, in the spe-remote folder on the Pi:
+
+```bash
+git pull && ./setup.sh && sudo ./install-service.sh
+```
+
+`git pull` fetches the new code, `./setup.sh` installs any new Python dependencies (it keeps your configuration), and `install-service.sh` restarts the service on the new code. Your `config.yaml` settings carry over.
+
+> If `git pull` stops with *"Your local changes to … config.yaml would be overwritten"* (the dashboard writes the °C/°F and radio settings back into that file), use `git stash && git pull && git stash pop` for the first step.
+
+To turn the check off, set `updates.check: false` in `config.yaml` and restart. For testing, starting the server with `SPE_REMOTE_UPDATE_TEST_VERSION=0.0.1` makes it compare as if 0.0.1 were running, so the banner shows against the current release.
 
 ## Orchestrated TUNE and Band Sweep
 
@@ -519,13 +541,14 @@ spe-remote/
 ├── server.py                      # Main entry point (signal-safe shutdown)
 ├── power_spe_on.py                # Original OH2GEK power-on script (reference)
 ├── spe/
-│   ├── __init__.py
+│   ├── __init__.py                # __version__ (bumped at every release)
 │   ├── config.py                  # YAML config loader
+│   ├── update_check.py            # Daily GitHub new-release check (banner + log line)
 │   ├── protocol.py                # SPE commands, response markers, state parser
 │   ├── power_control.py           # Power on (DTR) / off (0x0A) controller
 │   ├── serial_handler.py          # Thread reader + asyncio writer, CSV+RCU framing
 │   ├── websocket_handler.py       # Multi-client text+binary broadcast + keepalive
-│   └── app.py                     # Tornado app + no-cache static handler
+│   └── app.py                     # Tornado app, no-cache static handler, /api/update
 ├── web/                           # Bundled browser dashboard (text JSON only)
 │   ├── index.html
 │   ├── style.css
@@ -672,6 +695,24 @@ ws.send("band_up");     // band up
 ws.send("power_off");   // power OFF via 0x0A
 ```
 
+## HTTP: `GET /api/update`
+
+The dashboard's new-release banner reads the server's cached release check from this endpoint — the browser never calls GitHub itself, and the endpoint never waits on GitHub either:
+
+```json
+{
+  "enabled": true,
+  "current": "3.0.0",
+  "update_available": true,
+  "latest": "v3.1.0",
+  "html_url": "https://github.com/vu2cpl/spe-remote/releases/tag/v3.1.0",
+  "update_command": "git pull && ./setup.sh && sudo ./install-service.sh",
+  "checked_at": 1791481827.7
+}
+```
+
+`update_available` stays `false` (and `latest` / `html_url` `null`) until a check finds a newer release; the first check runs about a minute after start. Other clients (MacExpert, Node-RED) can poll it the same way. No auth — LAN-only, like the WebSocket.
+
 ## Troubleshooting
 
 | Problem | Solution |
@@ -687,6 +728,7 @@ ws.send("power_off");   // power OFF via 0x0A
 | RCU frames never arrive | Check the companion client actually reads binary WebSocket messages; the browser dashboard doesn't |
 | Server doesn't exit on Ctrl+C | Should never happen with the new shutdown handler — if it does, check for a hung serial read and file an issue |
 | MacExpert can't send commands | Verify `wsCommandName` enum in Swift matches `COMMANDS` keys in `spe/protocol.py` |
+| New-release banner never shows | It only appears when GitHub has a release newer than the running version. Check `updates.check` isn't `false`, `curl http://<pi>:8888/api/update`, and set `logging.level: DEBUG` to see the `Update check` lines (a failed check is only logged at DEBUG) |
 
 ## Credits
 

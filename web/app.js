@@ -16,6 +16,8 @@
       setConnected(true);
       // Pull the current radio config so the settings panel reflects it.
       ws.send("get_config");
+      // (Re)connected — possibly to a freshly updated server.
+      checkUpdateStatus();
     };
 
     ws.onclose = () => {
@@ -583,6 +585,47 @@
   // Render band buttons once on first page load so reopening the
   // panel is instant.
   document.addEventListener("DOMContentLoaded", renderBandButtons);
+
+  // --- New-release banner ---
+  // The server asks GitHub for the latest release on its own thread
+  // (shortly after start, then daily) and caches the answer; this only
+  // reads that cache from /api/update, so it never calls GitHub itself.
+  // Built with textContent / createElement — no release text is ever
+  // interpreted as HTML.
+  function checkUpdateStatus() {
+    fetch("/api/update", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then(renderUpdateBanner)
+      .catch(() => {});
+  }
+
+  function renderUpdateBanner(u) {
+    const el = document.getElementById("updateBanner");
+    if (!el) return;
+    el.textContent = "";
+    if (!u || !u.update_available || !u.latest) {
+      el.hidden = true;
+      return;
+    }
+    el.append(`spe-remote ${u.latest} is available (running ${u.current}) — `);
+    const link = document.createElement("a");
+    link.href = u.html_url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "release notes";
+    el.append(link);
+    if (u.update_command) {
+      el.append(". Update: in the spe-remote folder run ");
+      const cmd = document.createElement("code");
+      cmd.textContent = u.update_command;
+      el.append(cmd);
+    }
+    el.hidden = false;
+  }
+
+  // The first server-side check lands ~60 s after the server starts, so
+  // re-read the cache now and then rather than only at page load.
+  setInterval(checkUpdateStatus, 10 * 60 * 1000);
 
   // --- Init ---
   connect();

@@ -307,6 +307,34 @@ h1 span { color: var(--accent); font-weight: 600; }
   color: #000;
 }
 
+/* New-release notice (GET /api/update) */
+.update-banner {
+  width: 100%;
+  max-width: 700px;
+  margin-bottom: 1rem;
+  padding: 0.45rem 0.75rem;
+  border: 1px solid rgba(0, 188, 212, 0.35);
+  border-radius: 6px;
+  background: rgba(0, 188, 212, 0.10);
+  color: var(--text);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.update-banner[hidden] { display: none; }
+.update-banner a { color: var(--accent); }
+.update-banner code {
+  display: inline-block;   /* wrap the command as a unit when it fits */
+  max-width: 100%;
+  overflow-wrap: normal;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 0 0.3rem;
+  border-radius: 3px;
+}
+
 /* Warnings / errors */
 .alert-bar {
   width: 100%;

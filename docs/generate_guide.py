@@ -295,6 +295,7 @@ def build_pdf(output_path):
             ["polling.tx_interval", "0.2", "Poll interval during TX (sec)"],
             ["polling.idle_interval", "1.0", "Poll interval during RX/Standby"],
             ["polling.heartbeat", "15", "Force state broadcast interval"],
+            ["updates.check", "true", "Daily GitHub new-release check (banner)"],
             ["logging.level", "INFO", "DEBUG / INFO / WARNING / ERROR"],
         ],
         [4*cm, 2.5*cm, 7.5*cm], font_size=8,

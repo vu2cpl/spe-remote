@@ -16,6 +16,7 @@ from pathlib import Path
 
 import tornado.ioloop
 
+from spe import __version__
 from spe.config import load_config
 from spe.app import make_app
 from spe.serial_handler import SerialHandler
@@ -23,6 +24,7 @@ from spe.power_control import PowerController
 from spe.websocket_handler import AmplifierWebSocket
 from spe.radio_controller import RadioController
 from spe.tune_orchestrator import TuneOrchestrator
+from spe.update_check import UpdateChecker
 
 
 async def presence_heartbeat_loop(
@@ -152,12 +154,19 @@ def main() -> None:
         heartbeat=config.polling.heartbeat,
     )
 
-    app = make_app()
+    # GitHub release check: own daemon thread, first look ~60 s after
+    # start then daily; the dashboard reads the cached answer from
+    # /api/update. Never on the amp control path, never auto-updates.
+    update_checker = UpdateChecker(enabled=config.updates.check)
+
+    app = make_app(update_checker=update_checker)
     app.listen(config.server.port, address=config.server.host)
 
+    logger.info(f"spe-remote {__version__}")
     logger.info(
         f"Server listening on http://{config.server.host}:{config.server.port}/"
     )
+    update_checker.start()
     logger.info(f"Serial port: {config.serial.port} @ {config.serial.baudrate} baud")
 
     loop = asyncio.get_event_loop()
@@ -204,6 +213,8 @@ def main() -> None:
     try:
         tornado.ioloop.IOLoop.current().start()
     finally:
+        update_checker.stop()
+
         # Ensure background tasks are cancelled if still running
         cleanup_tasks = [serial_task, heartbeat_task]
         for task in cleanup_tasks:
