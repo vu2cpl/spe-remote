@@ -255,6 +255,16 @@ Only if a release changes the Python dependencies (`requirements.txt` — the re
 
 To turn the check off, set `updates.check: false` in `config.yaml` and restart. For testing, starting the server with `SPE_REMOTE_UPDATE_TEST_VERSION=0.0.1` makes it compare as if 0.0.1 were running, so the banner shows against the current release (this works on a development version too).
 
+### 8. Optional: TLS and a login (reverse proxy)
+
+spe-remote has no login of its own, so anything that can reach port 8888 on
+the LAN can drive the amp. Binding it to `127.0.0.1` and putting
+[Caddy](https://caddyserver.com/) on the LAN address adds TLS, an HTTP Basic
+login and a cross-origin refusal. Node-RED on the Pi keeps using
+`ws://127.0.0.1:8888/ws`, and MacExpert connects with **Use TLS (wss)**. The
+steps, a tested Caddyfile and troubleshooting are in
+[docs/REVERSE-PROXY.md](docs/REVERSE-PROXY.md).
+
 ## Orchestrated TUNE and Band Sweep
 
 spe-remote can drive a transmit rig to key a clean carrier while the SPE's ATU sweeps. Set `radio.kind` in `config.yaml` to pick the backend — `flex` (FlexRadio over SmartSDR), `tci` (Expert Electronics SunSDR / ExpertSDR3 over TCI), or `none` — and it exposes these additional WebSocket commands that any client (MacExpert, browser dashboard, Node-RED) can call:
