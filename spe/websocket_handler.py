@@ -39,8 +39,11 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
         cls._config_path = config_path
         cls._heartbeat_interval = heartbeat
 
-    def check_origin(self, origin) -> bool:
-        return True
+    # No check_origin override: Tornado's default refuses a browser whose
+    # Origin host differs from the request Host, so a page on another site
+    # can't power the amp on / key it through a visitor's browser. The web
+    # UI served from this server (same origin), MacExpert and Node-RED
+    # (no Origin header) still connect. See tests/test_ws_origin.py.
 
     def open(self) -> None:
         AmplifierWebSocket.clients.add(self)
