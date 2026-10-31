@@ -128,7 +128,7 @@ def build_pdf(output_path):
     story.append(Spacer(1, 40))
 
     info_data = [
-        ["Version", "3.0.1 (multi-radio tune + new-release check)"],
+        ["Version", "3.0.2 (refuses cross-origin WebSocket connections)"],
         ["Platform", "Raspberry Pi / Linux / macOS"],
         ["Interface", "Web browser + MacExpert native"],
         ["Connection", "USB / RS-232 Serial"],

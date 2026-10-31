@@ -2,11 +2,12 @@
 
 **Repo:** `~/projects/spe-remote` (canonical; the copy under `~/Documents/Claude/code/spe-remote` is stale, do not touch)
 **Branch:** `main`, clean, in sync with `origin/main`
-**Latest release:** `v3.0.1` — SunSDR/TCI tune, safer band sweep, new-release check (2026-10-09; see Releases). **Every release must bump `__version__` in `spe/__init__.py`** (the update check compares it with the tag) — see Deployment → Release checklist.
-**Unreleased on main:** nothing — main = v3.0.1 plus handover-only commits.
-**Pi (noderedpi4):** runs **v3.0.1** (`50c2ac2`) since 2026-10-09 05:15 IST — deployed after the amp was put in STANDBY (listen-only WS read: `op_status: Stby`, RX, 80m, 0 W, no tune); `git pull --ff-only` + `sudo systemctl restart spe-remote`; log: "spe-remote 3.0.1", serial reconnected, amp Stby, Node-RED reconnected within 2 s; first update check 60 s later succeeded (`/api/update`: current 3.0.1, no update, `checked_at` set).
-**Last commit:** the v3.0.1 release commit `1271287` (`__version__` 3.0.1, guide PDF, this file) and the deploy-held-back note. Before it: `e44eadc` update-check follow-up, `584fdea` the check itself, `5f106df` multi-radio tune (PR #4, Recent work 2).
-**Date:** 2026-10-09
+**Latest release:** `v3.0.2` — refuses cross-origin WebSocket connections (2026-10-31; see Releases). **Every release must bump `__version__` in `spe/__init__.py`** (the update check compares it with the tag) — see Deployment → Release checklist.
+**Unreleased on main:** nothing — main = v3.0.2 plus handover-only commits.
+**Pi (noderedpi4):** runs **v3.0.2** (see Releases for the deploy). Before it: main `0c5a75a` (v3.0.1 + PR #5 + #6) from 2026-10-31 08:49 IST, and **v3.0.1** (`50c2ac2`) from 2026-10-09 05:15 IST. Every Pi deploy so far was done with the amp in STANDBY, confirmed by a listen-only WebSocket read beforehand, then `git pull --ff-only` + `sudo systemctl restart spe-remote`.
+**Not applied here:** the Caddy TLS + login setup from PR #6; the server still binds `0.0.0.0:8888`.
+**Last commit:** the v3.0.2 release commit (`__version__` 3.0.2, guide PDF, this file). Before it: `0c5a75a` Caddy guide (PR #6), `e6c66bf` cross-origin refusal (PR #5).
+**Date:** 2026-10-31
 
 ## What this project is
 
@@ -39,6 +40,13 @@ docs/                  protocol notes, Node-RED sample flow
 
 ## Releases
 
+- **v3.0.2 (2026-10-31)** — tag on the release commit; https://github.com/vu2cpl/spe-remote/releases/tag/v3.0.2 — no assets. A security patch release with two PRs by Vinod VU3ESV/LB9KJ:
+  - **PR #5 `e6c66bf`:** removes the `check_origin` override, so Tornado's default refuses a WebSocket upgrade whose `Origin` host differs from `Host`. Before it, any web page in a LAN browser could send `power_on` / `oper` / `tune` (cross-site WebSocket hijacking). Native clients and Node-RED send no Origin and are unaffected. Test: `tests/test_ws_origin.py`.
+  - **PR #6 `0c5a75a`:** adds `docs/REVERSE-PROXY.md`, the optional Caddy TLS + Basic login guide.
+
+  Release commit: `__version__ = "3.0.2"`, guide Version row `3.0.2 (refuses cross-origin WebSocket connections)`, PDF regenerated with reportlab in a throwaway venv. All seven `tests/test_*.py` passed. No `requirements.txt` or systemd-unit change, so the upgrade is `git pull --ff-only && sudo systemctl restart spe-remote`.
+
+  **Pi:** first ran main `0c5a75a` on 2026-10-31 08:49 IST. Checks: amp read `Stby`, RX, 15m, 0 W before the restart; a live probe from the Mac got 101 for no Origin and same origin, and 403 for `https://evil.example` and `http://<pi>:1880`; Node-RED reconnected within 2 s. The Pi was then moved to the v3.0.2 tag the same way.
 - **v3.0.1 (2026-10-09)** — tag on the release commit (the one that bumps `__version__` to `3.0.1`); https://github.com/vu2cpl/spe-remote/releases/tag/v3.0.1 — no assets (like v3.0.0). Manoj approved it as the next *patch* version, although the content since v3.0.0 is feature-sized: the new-release check + banner (Recent work 1), multi-radio SunSDR/TCI tune + client-selected radio config (PR #4, Recent work 2), tune in CW (3), radio-rules sweep band (4), sweep auto-STBY / band check / OPERATE restore (5), Flex on-demand connect (PR #3, 7), p_out AVG/PEAK (8), the in-repo `tests/`. Release commit: `__version__ = "3.0.1"`, guide Version row `3.0.1 (multi-radio tune + new-release check)` + PDF regenerated with reportlab 5.0.1 (Homebrew python3), all six `tests/test_*.py` ALL PASS before and after the bump. No `requirements.txt` or systemd-unit change since v3.0.0 → notes say `git pull --ff-only && sudo systemctl restart spe-remote` is the whole upgrade. Credits in the notes: OH2GEK (original), Vinod VU3ESV/LB9KJ (PR #3, PR #4), SM5TOG's sm5k-spe-tuner (TCI reference).
   - **Pi deploy DONE 2026-10-09 05:15 IST** (amp in STANDBY, Manoj: "amp is ready to update") — see the Pi line at the top. Earlier attempt:
   - **Pi deploy NOT done (2026-10-09 05:11 IST) — amp was in OPERATE.** Pre-restart check on noderedpi4 (`vu2cpl@192.168.1.169`, `/home/vu2cpl/spe-remote`), read-only: a listen-only WebSocket client (venv tornado, sent nothing) got `op_status: Oper`, `tx_status: RX`, 80m, `p_out 0000`, no warnings/errors, `tune_active: false`, 1.5K-FA, `serial: up`, one other client (Node-RED on 127.0.0.1), and the journal showed that client sending `power_level` three times at 04:59:59–05:00:03 — someone was operating. So no `git pull`, no restart. The Pi clone is clean, on `main` at `c494407` (pre-update-check), service active since 2026-10-08 11:04 IST (PID 1927). To deploy when the amp is in STANDBY/off and nobody is on the air: `ssh vu2cpl@192.168.1.169`, `cd /home/vu2cpl/spe-remote && git pull --ff-only && sudo systemctl restart spe-remote`, then `systemctl is-active spe-remote`, `journalctl -u spe-remote -n 30 --no-pager` (expect `Update check` start + serial reconnect), `curl -s http://127.0.0.1:8888/api/update` (`current` 3.0.1). No `setup.sh` / `install-service.sh` needed (no requirements/unit change).
