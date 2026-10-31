@@ -583,6 +583,8 @@ To import: Node-RED ☰ menu → Import → paste the file contents → Import. 
 
 Connect to `ws://<host>:8888/ws`
 
+A browser may only connect from a page served by this server: an upgrade whose `Origin` host differs from the request's `Host` gets **403**. Without that check, any web page open in a browser on the LAN could power the amp on or key a tune. Native clients and Node-RED send no `Origin` and connect as before. A dashboard on another port (e.g. Node-RED's `:1880`) must go through its own server-side WebSocket client rather than connect from the browser.
+
 The socket carries **three** kinds of server-to-client messages: JSON state updates (text), JSON power-action results (text), and raw RCU LCD frames (binary). Clients that don't care about RCU should ignore binary messages.
 
 ### Server → Client
