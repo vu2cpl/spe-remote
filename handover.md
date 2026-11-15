@@ -3,7 +3,7 @@
 **Repo:** `~/projects/spe-remote` (canonical; the copy under `~/Documents/Claude/code/spe-remote` is stale, do not touch)
 **Branch:** `main`, clean, in sync with `origin/main`
 **Latest release:** `v3.0.2` — refuses cross-origin WebSocket connections (2026-10-31; see Releases). **Every release must bump `__version__` in `spe/__init__.py`** (the update check compares it with the tag) — see Deployment → Release checklist.
-**Unreleased on main:** the stalled-read watchdog (2026-11-15, see "Unreleased on main" below). **Not yet on the Pi**: deploy with the amp in STANDBY or off.
+**Unreleased on main:** the stalled-read watchdog (2026-11-15, see "Unreleased on main" below). **On the Pi** since 2026-11-15 20:08 IST (`d5fd6ec`, amp in STANDBY); the amp-off hour check is still to do.
 **Pi (noderedpi4):** runs **v3.0.2** (see Releases for the deploy). Before it: main `0c5a75a` (v3.0.1 + PR #5 + #6) from 2026-10-31 08:49 IST, and **v3.0.1** (`50c2ac2`) from 2026-10-09 05:15 IST. Every Pi deploy so far was done with the amp in STANDBY, confirmed by a listen-only WebSocket read beforehand, then `git pull --ff-only` + `sudo systemctl restart spe-remote`.
 **Not applied here:** the Caddy TLS + login setup from PR #6; the server still binds `0.0.0.0:8888`.
 **Last commit:** the stalled-read watchdog (2026-11-15, code + tests + this file). Before it: the v3.0.2 release commit (`__version__` 3.0.2, guide PDF), `0c5a75a` Caddy guide (PR #6), `e6c66bf` cross-origin refusal (PR #5).
@@ -163,7 +163,7 @@ systemd unit `spe-remote.service` runs the server as a daemon. `install-service.
 
 ## Open threads / ideas (not started)
 
-- **Deploy the stalled-read watchdog to noderedpi4** (main after v3.0.2, 2026-11-15) with the amp in STANDBY or off, then do the amp-off hour check under "Unreleased on main". Release it as v3.0.3 when Manoj says so (release checklist applies).
+- **Stalled-read watchdog: amp-off hour check.** Deployed on noderedpi4 2026-11-15 20:08 IST (`d5fd6ec`; amp read STBY/RX at once after the restart). Next time the amp is off, leave it off for an hour and confirm it never wakes (log: `DTR=1 RTS=1 kept`). Release as v3.0.3 when Manoj says so (release checklist applies).
 - **Deploy v3.0.1 to noderedpi4** — held back 2026-10-09 05:11 IST (amp in OPERATE, Node-RED sending commands). Do it when the amp is in STANDBY/off: steps in Releases → v3.0.1.
 - **New-release check follow-up:** show the same notice in MacExpert by polling `/api/update` (not started; MacExpert is its own repo). The check itself shipped in v3.0.1.
 - **User guide PDF lags the code:** `docs/generate_guide.py` still describes Flex-only tuning — SunSDR/TCI, the RADIO settings panel, the auto-STBY/OPERATE-restore sweep and `/api/update` are not in the guide (v3.0.1 only bumped its Version row, per the checklist).
