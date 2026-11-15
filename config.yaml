@@ -24,6 +24,12 @@ polling:
                              # amp's CPU is dead). RCU is included because
                              # STANDBY slows CSV below the threshold while
                              # RCU OFF→ON ticks every 0.5 s keep frames flowing.
+  stall_reopen: 15            # reopen the serial port after N s with no bytes at
+                             # all. Recovers a stalled USB read (kernel "urb
+                             # stopped: -32", 2026-11-14) without a service
+                             # restart. DTR/RTS are kept across the reopen so the
+                             # amp's remote-power line never moves. Backs off to
+                             # 60 s while the amp is off. 0 = off.
 
 amp:
   # Must match the unit selected on the SPE front-panel setup menu —

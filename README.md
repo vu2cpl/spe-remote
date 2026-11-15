@@ -147,6 +147,8 @@ polling:
   tx_interval: 0.2      # Poll rate during TX (seconds)
   idle_interval: 1.0     # Poll rate during RX/Standby
   heartbeat: 15          # Force state push interval
+  stall_reopen: 15       # Reopen the port after N s with no bytes (USB read-stall
+                         # recovery; keeps DTR/RTS; backs off to 60 s); 0 = off
 
 amp:
   temperature_unit: C    # Must match the SPE setup-menu unit (C or F)
@@ -416,6 +418,8 @@ The serial handler parses both inline, dispatching CSV frames to `on_state_updat
 
 > **Note:** When DTR is held high, it takes power mastering control — the amplifier shows "POWER SWITCH HELD BY REMOTE" warning and the front-panel power switch is overridden. Startup takes 3–4.5 seconds.
 
+> **Stall reopens keep the lines where they are.** When the serial watchdog reopens a silent port (see Troubleshooting), it clears termios `HUPCL` before closing, so DTR does not drop, and opens the new handle with the same DTR/RTS levels. An amp held on by DTR stays on. If `HUPCL` can't be cleared, the reopen is skipped and the watchdog turns itself off for that run. The watchdog also holds off for `stall_reopen` seconds after a power ON/OFF click, so it never cuts into the DTR sequence or the amp's boot.
+
 ### Status String
 
 The amplifier returns a 67-character ASCII comma-separated status string with 19 fields:
@@ -519,7 +523,7 @@ The serial handler uses a hybrid thread + asyncio model instead of `pyserial-asy
 
 1. `server.py` creates `SerialHandler`, `PowerController`, and the Tornado app.
 2. Installs SIGINT/SIGTERM handlers that schedule `serial_handler.stop()` on the asyncio loop, then stop both Tornado and asyncio loops.
-3. `serial_handler.start()` loops: open port → spawn reader thread → run the five asyncio tasks via `asyncio.wait(FIRST_COMPLETED)` → tear down on any task exit → reconnect after 3 s.
+3. `serial_handler.start()` loops: open port → spawn reader thread → run the six asyncio tasks (poll, command, RCU tick, quiet flush, connection watchdog, stall watchdog) via `asyncio.wait(FIRST_COMPLETED)` → tear down on any task exit → reconnect after 3 s (at once after a stall reopen). Each reader thread has its own stop event, so a thread still finishing its last read can't tear down the port that replaced it.
 4. On `stop()`: sets `_stop_reader` event, sends `RCU_OFF` to the amp, closes the port, drops queued commands. The reader thread exits naturally once its port handle is closed.
 
 ## Service Internals
@@ -738,6 +742,7 @@ The dashboard's new-release banner reads the server's cached release check from 
 | Multiple `/dev/ttyUSBx` devices | Use `/dev/serial/by-id/...` path instead |
 | Power ON not working | Check FTDI USB-serial adapter supports DTR — verify with `dmesg` |
 | "POWER SWITCH HELD BY REMOTE" | Normal when DTR is held high after power on |
+| Amp shows `serial:"down"` while it is on, and `dmesg` has `ftdi_sio ttyUSB…: usb_serial_generic_read_bulk_callback - urb stopped: -32` | The USB read stalled: the port stays open but no bytes arrive. Since 2026-11-15 the stall watchdog reopens the port after `polling.stall_reopen` s (log: `No bytes from the amp … reopening the serial port … (DTR=… RTS=… kept)`) and the amp comes back by itself. On older versions, restart the service with the amp in STANDBY or off |
 | Logs show "Suppressed spurious USB-serial poll glitch" | Harmless — the kernel lies about poll readiness on USB-serial; the reader thread handles it |
 | RCU frames never arrive | Check the companion client actually reads binary WebSocket messages; the browser dashboard doesn't |
 | Server doesn't exit on Ctrl+C | Should never happen with the new shutdown handler — if it does, check for a hung serial read and file an issue |

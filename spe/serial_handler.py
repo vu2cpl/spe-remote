@@ -19,6 +19,23 @@ Parses two response types on the same byte stream:
     terminated by the next sync or a quiet period)
 
 CSV frames feed ``on_state_update``; RCU frames feed ``on_rcu_frame``.
+
+Stalled reads (added 2026-11-15): a USB fault on the Pi (kernel log
+``ftdi_sio ttyUSB0: usb_serial_generic_read_bulk_callback - urb stopped: -32``,
+seen 2026-11-14 on both shack FTDI adapters) stops the driver's read URB for
+good while the fd stays open and valid. Reads time out empty, writes still go
+out, no exception reaches the reconnect path, and the amp reads "down" until
+the service is restarted. Only a close + reopen restarts the URB, so
+``_stall_watchdog`` reopens the port after ``polling.stall_reopen`` s with no
+bytes. Silence also means "amp switched off", which the gateway cannot tell
+apart, so the reopen backs off to ``_STALL_REOPEN_MAX`` while silence lasts.
+
+The reopen must not move the DTR/RTS lines: DTR is the amp's remote power
+line, and while it is held high the front-panel switch is overridden. A
+plain close drops DTR (termios HUPCL), so ``_reopen_for_stall`` clears HUPCL
+before closing, the next open re-applies the old DTR/RTS levels, and HUPCL
+is set again so a service stop behaves as before. If HUPCL cannot be
+cleared, the reopen is skipped and the watchdog turns itself off.
 """
 
 from __future__ import annotations  # Allow PEP 604 unions (X | None) on Python 3.9
@@ -68,6 +85,22 @@ _MAX_BUFFER = 4096
 # amp sends them.
 _READ_TIMEOUT = 0.1
 
+# Stalled-read recovery (see module docstring).
+_STALL_REOPEN_MAX = 60.0   # backoff cap while the amp stays silent
+_WATCHDOG_TICK = 1.0       # seconds between stall checks
+_RECONNECT_DELAY = 3.0     # after a real serial error (unchanged behaviour)
+
+
+def _set_hupcl(port, on: bool) -> None:
+    """Set or clear termios HUPCL (drop DTR/RTS on last close) on an open port."""
+    import termios   # POSIX only; on Windows this raises and the caller copes
+    attrs = termios.tcgetattr(port.fd)
+    if on:
+        attrs[2] |= termios.HUPCL
+    else:
+        attrs[2] &= ~termios.HUPCL
+    termios.tcsetattr(port.fd, termios.TCSANOW, attrs)
+
 
 class SerialHandler:
     """Manages serial communication with the SPE amplifier.
@@ -112,6 +145,16 @@ class SerialHandler:
 
         self._buffer = bytearray()
         self._last_byte_at: float = 0.0
+
+        # Stalled-read recovery (see module docstring). Times are monotonic.
+        self._stall_after = float(getattr(polling_config, "stall_reopen", 15.0))
+        self._opened_at: float = 0.0
+        self._stall_hold_until: float = 0.0   # no stall reopen before this
+        self._reopen_interval = self._stall_after
+        self._in_stall = False                # silence episode (log levels)
+        self._stall_reopen_pending = False    # reconnect now, not in 3 s
+        self._preserve_lines: tuple | None = None   # (dtr, rts) for the next open
+        self.stall_reopens = 0
         # Optional raw-byte capture for protocol investigation. When
         # serial.debug_raw_log is set in config.yaml, every chunk the
         # reader receives is appended as "<monotonic> <hex>\n" before
@@ -262,8 +305,14 @@ class SerialHandler:
             finally:
                 self._teardown_port()
             if self._running:
-                logger.info("Reconnecting in 3 seconds...")
-                await asyncio.sleep(3)
+                if self._stall_reopen_pending:
+                    # Stall reopen: straight back in, so a power-ON click
+                    # never lands in a gap with no port.
+                    self._stall_reopen_pending = False
+                    await asyncio.sleep(0.05)
+                else:
+                    logger.info(f"Reconnecting in {_RECONNECT_DELAY:.0f} seconds...")
+                    await asyncio.sleep(_RECONNECT_DELAY)
 
     async def stop(self) -> None:
         self._running = False
@@ -307,26 +356,48 @@ class SerialHandler:
     # ------------------------------------------------------------------
 
     async def _open_port(self) -> None:
-        logger.info(
+        log = logger.debug if self._in_stall else logger.info
+        log(
             f"Connecting to {self.serial_config.port} "
             f"at {self.serial_config.baudrate} baud..."
         )
-        port = serial.Serial(
-            port=self.serial_config.port,
-            baudrate=self.serial_config.baudrate,
-            timeout=_READ_TIMEOUT,
-            write_timeout=1.0,
-        )
+        lines, self._preserve_lines = self._preserve_lines, None
+        if lines is None:
+            port = serial.Serial(
+                port=self.serial_config.port,
+                baudrate=self.serial_config.baudrate,
+                timeout=_READ_TIMEOUT,
+                write_timeout=1.0,
+            )
+        else:
+            # Stall reopen: open with the DTR/RTS levels the old handle had,
+            # so the amp's remote-power line does not move.
+            port = serial.Serial(
+                baudrate=self.serial_config.baudrate,
+                timeout=_READ_TIMEOUT,
+                write_timeout=1.0,
+            )
+            port.port = self.serial_config.port
+            port.dtr, port.rts = lines
+            port.open()
+        try:
+            _set_hupcl(port, True)   # the default; undoes the stall path's clear
+        except Exception as e:
+            logger.debug(f"Could not set HUPCL: {e}")
         self._port = port
         self._connected = True
         self._buffer.clear()
         self._last_byte_at = 0.0
-        logger.info("Serial connected")
+        self._opened_at = time.monotonic()
+        log("Serial connected")
 
-        # Fire up the reader thread.
-        self._stop_reader.clear()
+        # Fire up the reader thread. Each thread gets its own stop event:
+        # a shared one cleared here could let the previous thread (still
+        # inside its last read) carry on and tear down this new port.
+        self._stop_reader = threading.Event()
         self._reader_thread = threading.Thread(
             target=self._reader_loop,
+            args=(port, self._stop_reader),
             name="spe-serial-reader",
             daemon=True,
         )
@@ -410,16 +481,17 @@ class SerialHandler:
     # Reader thread
     # ------------------------------------------------------------------
 
-    def _reader_loop(self) -> None:
-        port = self._port
+    def _reader_loop(self, port, stop: threading.Event) -> None:
         loop = self._loop
         if port is None or loop is None:
             return
         spurious_count = 0
-        while not self._stop_reader.is_set():
+        while not stop.is_set():
             try:
                 data = port.read(256)
             except serial.SerialException as e:
+                if stop.is_set():
+                    return      # port closed under us on purpose
                 msg = str(e)
                 if "readiness to read but returned no data" in msg:
                     # Linux USB-serial kernel-level spurious readable flag.
@@ -436,11 +508,15 @@ class SerialHandler:
                     time.sleep(0.005)
                     continue
                 logger.error(f"Serial read failed: {e}")
-                loop.call_soon_threadsafe(self._signal_disconnect)
+                loop.call_soon_threadsafe(self._signal_disconnect, port)
                 return
-            except OSError as e:
+            except (OSError, TypeError, ValueError) as e:
+                # TypeError/ValueError: pyserial reading an fd that was just
+                # closed by teardown.
+                if stop.is_set():
+                    return
                 logger.error(f"Serial read OS error: {e}")
-                loop.call_soon_threadsafe(self._signal_disconnect)
+                loop.call_soon_threadsafe(self._signal_disconnect, port)
                 return
             if not data:
                 # Timeout with no data — not an error, just continue.
@@ -448,20 +524,21 @@ class SerialHandler:
             spurious_count = 0  # Real data flushes the glitch state.
             loop.call_soon_threadsafe(self._ingest_chunk, bytes(data))
 
-    def _signal_disconnect(self) -> None:
-        """Called on the asyncio loop when the reader thread has bailed.
+    def _signal_disconnect(self, port) -> None:
+        """Called on the asyncio loop when a reader thread has bailed.
         Tearing down the port here causes ``_run_loop`` to exit which kicks
-        off a reconnect from ``start``'s outer loop."""
+        off a reconnect from ``start``'s outer loop. Ignored when that
+        reader's port is no longer the current one (already replaced)."""
+        if port is not self._port:
+            return
         self._stop_reader.set()
         # Closing the port makes any pending write raise, and the run loop
         # tasks will finish naturally.
-        port = self._port
-        if port is not None:
-            try:
-                if port.is_open:
-                    port.close()
-            except Exception:
-                pass
+        try:
+            if port.is_open:
+                port.close()
+        except Exception:
+            pass
 
     def _ingest_chunk(self, chunk: bytes) -> None:
         if not chunk:
@@ -483,6 +560,11 @@ class SerialHandler:
                 self._raw_log_file = None
         self._buffer.extend(chunk)
         self._last_byte_at = time.monotonic()
+        if self._in_stall:
+            self._in_stall = False
+            logger.info("Amp replying again")
+        self._reopen_interval = self._stall_after
+        self._stall_hold_until = 0.0
         if len(self._buffer) > _MAX_BUFFER:
             logger.warning("Receive buffer overflowed, dropping stale bytes")
             self._buffer.clear()
@@ -499,8 +581,10 @@ class SerialHandler:
         rcu_task = asyncio.create_task(self._rcu_tick_loop())
         flush_task = asyncio.create_task(self._quiet_flush_loop())
         watchdog_task = asyncio.create_task(self._connection_watchdog())
+        stall_task = asyncio.create_task(self._stall_watchdog())
 
-        tasks = [poll_task, cmd_task, rcu_task, flush_task, watchdog_task]
+        tasks = [poll_task, cmd_task, rcu_task, flush_task, watchdog_task,
+                 stall_task]
         try:
             done, pending = await asyncio.wait(
                 tasks,
@@ -527,6 +611,70 @@ class SerialHandler:
             if self._port is None or not self._port.is_open:
                 return
             await asyncio.sleep(0.25)
+
+    async def _stall_watchdog(self) -> None:
+        """Returns (ending ``_run_loop``, so ``start`` reconnects at once)
+        after closing a port that has been silent for ``stall_reopen`` s."""
+        while self._running:
+            await asyncio.sleep(_WATCHDOG_TICK)
+            if self._stall_due(time.monotonic()) and self._reopen_for_stall():
+                return
+
+    def _stall_due(self, now: float) -> bool:
+        if self._stall_after <= 0:
+            return False
+        port = self._port
+        if port is None or not port.is_open or now < self._stall_hold_until:
+            return False
+        return now - max(self._last_byte_at, self._opened_at) >= self._stall_after
+
+    def _reopen_for_stall(self) -> bool:
+        """Close the silent port without moving DTR/RTS; the next
+        ``_open_port`` re-applies the saved levels. False = skipped."""
+        port = self._port
+        now = time.monotonic()
+        try:
+            lines = (bool(port.dtr), bool(port.rts))
+            _set_hupcl(port, False)
+        except Exception as e:
+            logger.error(
+                f"Serial silent for {self._stall_after:.0f} s but the port can't "
+                f"be reopened without dropping DTR ({e}); stall recovery off "
+                f"for this run. If the amp stays 'down', restart spe-remote."
+            )
+            self._stall_after = 0
+            return False
+        if not self._in_stall:
+            self._in_stall = True
+            since = (f"{now - self._last_byte_at:.0f} s" if self._last_byte_at
+                     else "since the port opened")
+            logger.warning(
+                f"No bytes from the amp ({since}); reopening the serial port in "
+                f"case the USB read stalled (DTR={int(lines[0])} RTS={int(lines[1])} "
+                f"kept). Retrying with backoff up to {_STALL_REOPEN_MAX:.0f} s "
+                f"while it stays silent (normal when the amp is off)."
+            )
+        else:
+            logger.debug("Amp still silent; reopening the serial port again")
+        self.stall_reopens += 1
+        self._preserve_lines = lines
+        self._stall_reopen_pending = True
+        self._stall_hold_until = now + self._reopen_interval
+        self._reopen_interval = min(self._reopen_interval * 2, _STALL_REOPEN_MAX)
+        self._stop_reader.set()
+        try:
+            port.cancel_read()      # wake the reader out of its blocking read
+        except Exception:
+            pass
+        return True
+
+    def note_power_action(self) -> None:
+        """Called by PowerController before a power ON/OFF: a click means the
+        amp is wanted now, so drop the backoff, but hold stall reopens off for
+        one stall period so the DTR sequence and the amp's 3-4.5 s boot are
+        never cut short by a reopen."""
+        self._reopen_interval = self._stall_after
+        self._stall_hold_until = time.monotonic() + self._stall_after
 
     async def _poll_loop(self) -> None:
         while self._running:

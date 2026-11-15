@@ -49,6 +49,7 @@ class PowerController:
         Startup takes 3-4.5 seconds after this sequence.
         """
         async with self._lock:
+            self.serial_handler.note_power_action()
             return await asyncio.get_event_loop().run_in_executor(
                 None, self._power_on_sync
             )
@@ -60,6 +61,7 @@ class PowerController:
         equivalent of pressing the front-panel OFF switch.
         """
         async with self._lock:
+            self.serial_handler.note_power_action()
             return await asyncio.get_event_loop().run_in_executor(
                 None, self._power_off_sync
             )

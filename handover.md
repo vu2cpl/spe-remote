@@ -3,11 +3,11 @@
 **Repo:** `~/projects/spe-remote` (canonical; the copy under `~/Documents/Claude/code/spe-remote` is stale, do not touch)
 **Branch:** `main`, clean, in sync with `origin/main`
 **Latest release:** `v3.0.2` — refuses cross-origin WebSocket connections (2026-10-31; see Releases). **Every release must bump `__version__` in `spe/__init__.py`** (the update check compares it with the tag) — see Deployment → Release checklist.
-**Unreleased on main:** nothing — main = v3.0.2 plus handover-only commits.
+**Unreleased on main:** the stalled-read watchdog (2026-11-15, see "Unreleased on main" below). **Not yet on the Pi**: deploy with the amp in STANDBY or off.
 **Pi (noderedpi4):** runs **v3.0.2** (see Releases for the deploy). Before it: main `0c5a75a` (v3.0.1 + PR #5 + #6) from 2026-10-31 08:49 IST, and **v3.0.1** (`50c2ac2`) from 2026-10-09 05:15 IST. Every Pi deploy so far was done with the amp in STANDBY, confirmed by a listen-only WebSocket read beforehand, then `git pull --ff-only` + `sudo systemctl restart spe-remote`.
 **Not applied here:** the Caddy TLS + login setup from PR #6; the server still binds `0.0.0.0:8888`.
-**Last commit:** the v3.0.2 release commit (`__version__` 3.0.2, guide PDF, this file). Before it: `0c5a75a` Caddy guide (PR #6), `e6c66bf` cross-origin refusal (PR #5).
-**Date:** 2026-10-31
+**Last commit:** the stalled-read watchdog (2026-11-15, code + tests + this file). Before it: the v3.0.2 release commit (`__version__` 3.0.2, guide PDF), `0c5a75a` Caddy guide (PR #6), `e6c66bf` cross-origin refusal (PR #5).
+**Date:** 2026-11-15
 
 ## What this project is
 
@@ -37,6 +37,15 @@ run.sh                 dev launcher
 setup.sh               first-time venv + deps install
 docs/                  protocol notes, Node-RED sample flow
 ```
+
+## Unreleased on main
+
+- **Stalled-read watchdog (2026-11-15).** At about 18:05 IST on 2026-11-14 the Pi's kernel logged `ftdi_sio ttyUSB0: usb_serial_generic_read_bulk_callback - urb stopped: -32` on this adapter (AI040V80) and on the rotator's adapter at the same moment. An EPIPE on the bulk-in URB makes the driver stop resubmitting it, so reads stay empty until the tty is closed and reopened. The fd stays valid and writes still work, so nothing reached the reconnect path. The amp would have read `serial:"down"` until a restart. Found while fixing the rotator's frozen heading (rotator-remote HANDOVER 2026-11-15). spe-remote itself was not restarted.
+  - **Fix:** `_stall_watchdog` (sixth task in `_run_loop`). When the port is open and no byte at all has arrived for `polling.stall_reopen` s (default 15; a healthy amp sends a frame at least every 3 s, see `amp_alive_threshold`), `_reopen_for_stall` closes it and `start` reconnects at once instead of after 3 s. Silence also means "amp off", so retries back off 15 → 30 → 60 s while it lasts. Logging: one WARNING per silence episode, later reopens at DEBUG, `Amp replying again` at INFO.
+  - **DTR safety (the part that matters):** a plain close drops DTR through termios `HUPCL`, and DTR held high is what keeps a remotely powered amp on. So `_reopen_for_stall` clears `HUPCL` on the old fd before closing, saves `port.dtr` / `port.rts`, and `_open_port` builds the new `Serial` closed, sets those levels, then opens it, and sets `HUPCL` again (so a service stop behaves as before; every open now sets it, which is the Linux default anyway). If `HUPCL` can't be cleared the reopen is skipped and the watchdog is off for that run. `PowerController.power_on/off` call `serial_handler.note_power_action()`, which holds reopens off for one stall period so the 1 s DTR sequence and the 3–4.5 s boot are never cut. Kernel note: the tty open itself raises DTR and RTS before pyserial applies the saved levels, so after a power-ON sequence (RTS low) RTS may go high for a few ms during a stall reopen; DTR does not move. A service start already does the same.
+  - **Reader race fixed on the way:** `_open_port` used to `clear()` the shared `_stop_reader` event, so a previous reader thread still inside its last read could carry on, hit the closed fd, and `_signal_disconnect` the *new* port. Each reader thread now gets its own `Event` and its port as arguments, and `_signal_disconnect(port)` ignores a port that is no longer current. A read error after its stop event is set is no longer logged as an error.
+  - **Tests:** `tests/test_stall_reopen.py` (needs pyserial + pyyaml): stall recovers, with the event order HUPCL-clear → close → open with DTR=1 RTS=0 → HUPCL-set checked; the old reader leaves the new port alone; a silent amp backs off and keeps DTR=1 RTS=1 on every reopen; a power click holds reopens off; a HUPCL failure skips the reopen and leaves the port open; `_set_hupcl` against real termios on a pty. It fails on the old code. All eight `tests/test_*.py` pass (run in a throwaway venv on macOS).
+  - **Not verified on hardware yet.** First check after deploying: with the amp **off**, let the watchdog cycle for an hour and confirm the amp never wakes (log shows `DTR=1 RTS=1 kept`). Then, with the amp on in STANDBY, there is no safe way to force a real URB stall; rely on the event-order test.
 
 ## Releases
 
@@ -154,6 +163,7 @@ systemd unit `spe-remote.service` runs the server as a daemon. `install-service.
 
 ## Open threads / ideas (not started)
 
+- **Deploy the stalled-read watchdog to noderedpi4** (main after v3.0.2, 2026-11-15) with the amp in STANDBY or off, then do the amp-off hour check under "Unreleased on main". Release it as v3.0.3 when Manoj says so (release checklist applies).
 - **Deploy v3.0.1 to noderedpi4** — held back 2026-10-09 05:11 IST (amp in OPERATE, Node-RED sending commands). Do it when the amp is in STANDBY/off: steps in Releases → v3.0.1.
 - **New-release check follow-up:** show the same notice in MacExpert by polling `/api/update` (not started; MacExpert is its own repo). The check itself shipped in v3.0.1.
 - **User guide PDF lags the code:** `docs/generate_guide.py` still describes Flex-only tuning — SunSDR/TCI, the RADIO settings panel, the auto-STBY/OPERATE-restore sweep and `/api/update` are not in the guide (v3.0.1 only bumped its Version row, per the checklist).
