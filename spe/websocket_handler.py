@@ -25,12 +25,14 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
     _last_json = ""
     _last_broadcast_time = 0.0
     _heartbeat_interval = 15.0
+    _amp_alive_threshold = 3.0
 
     @classmethod
     def configure(cls, serial_handler, power_controller=None,
                   tune_orchestrator=None, radio_controller=None,
                   app_config=None, config_path="config.yaml",
-                  heartbeat: float = 15.0) -> None:
+                  heartbeat: float = 15.0,
+                  amp_alive_threshold: float = 3.0) -> None:
         cls._serial_handler = serial_handler
         cls._power_controller = power_controller
         cls._tune_orchestrator = tune_orchestrator
@@ -38,6 +40,7 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
         cls._app_config = app_config
         cls._config_path = config_path
         cls._heartbeat_interval = heartbeat
+        cls._amp_alive_threshold = amp_alive_threshold
 
     # No check_origin override: Tornado's default refuses a browser whose
     # Origin host differs from the request Host, so a page on another site
@@ -51,11 +54,22 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
             f"Client connected ({self.request.remote_ip}), "
             f"{len(self.clients)} total"
         )
-        # Send current state immediately to new client
+        # Tell the new client at once where the amp stands, instead of
+        # leaving it to wait up to presence_heartbeat seconds:
+        #   - the current state, but only while the amp is replying. The
+        #     cached state of an amp that has gone silent (powered off) is
+        #     the last thing it said, e.g. Stby, and a client that takes a
+        #     state frame as "the amp is on" then shows a false ON. Seen
+        #     2026-11-17: a dashboard's power toggle sent power_off for
+        #     hours instead of power_on.
+        #   - then the presence heartbeat, so serial:"up"|"down" arrives
+        #     with the connect in both cases.
         if self._serial_handler:
-            state_json = self._serial_handler.state.to_json()
+            alive = self._serial_handler.amp_alive(self._amp_alive_threshold)
             try:
-                self.write_message(state_json)
+                if alive:
+                    self.write_message(self._serial_handler.state.to_json())
+                self.write_message(self.presence_json(alive))
             except tornado.websocket.WebSocketClosedError:
                 pass
 
@@ -405,6 +419,17 @@ class AmplifierWebSocket(tornado.websocket.WebSocketHandler):
             "ts": time.time(),
         })
         cls.broadcast_raw(msg)
+
+    @classmethod
+    def presence_json(cls, alive: bool) -> str:
+        """The presence heartbeat message. ``serial`` is amp liveness
+        (:meth:`SerialHandler.amp_alive`), not USB-link state."""
+        return json.dumps({
+            "heartbeat": True,
+            "serial": "up" if alive else "down",
+            "ts": time.time(),
+            "clients": len(cls.clients),
+        })
 
     @classmethod
     def broadcast_raw(cls, msg: str) -> None:

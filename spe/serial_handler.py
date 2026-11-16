@@ -272,6 +272,17 @@ class SerialHandler:
             return float("inf")
         return time.monotonic() - self._last_rcu_at
 
+    def amp_alive(self, threshold: float) -> bool:
+        """True iff the amp sent a CSV state frame or an RCU display frame
+        within the last ``threshold`` seconds.
+
+        The one definition of "the amp is replying", shared by the
+        presence heartbeat (``serial: "up"|"down"``) and by the
+        WebSocket's on-connect snapshot. ``connected`` cannot answer
+        this: the FTDI port stays open while the amp is powered off.
+        """
+        return min(self.last_state_age, self.last_rcu_age) < threshold
+
     @property
     def last_tune_active(self) -> bool:
         """True iff the most recent RCU frame had byte 4 bit 6 CLEAR,

@@ -589,7 +589,7 @@ Connect to `ws://<host>:8888/ws`
 
 A browser may only connect from a page served by this server: an upgrade whose `Origin` host differs from the request's `Host` gets **403**. Without that check, any web page open in a browser on the LAN could power the amp on or key a tune. Native clients and Node-RED send no `Origin` and connect as before. A dashboard on another port (e.g. Node-RED's `:1880`) must go through its own server-side WebSocket client rather than connect from the browser.
 
-The socket carries **three** kinds of server-to-client messages: JSON state updates (text), JSON power-action results (text), and raw RCU LCD frames (binary). Clients that don't care about RCU should ignore binary messages.
+The socket carries **four** kinds of server-to-client messages: JSON state updates (text), JSON power-action results (text), raw RCU LCD frames (binary), and a JSON presence heartbeat (text). Clients that don't care about RCU should ignore binary messages.
 
 ### Server → Client
 
@@ -638,6 +638,26 @@ The socket carries **three** kinds of server-to-client messages: JSON state upda
 **3. RCU LCD frame (binary, broadcast whenever the amp display changes):**
 
 The payload is the raw bytes **after** the `AA AA AA 6A` sync+marker — i.e. the content portion of the RCU frame only. Decoding this into a pixel buffer is client-specific; see MacExpert's `RCUFrameDecoder.swift` for a reference implementation.
+
+**4. Presence heartbeat (text JSON, every `polling.presence_heartbeat` seconds, default 5, and once at connect):**
+
+```json
+{
+  "heartbeat": true,
+  "serial": "up",
+  "ts": 1794869632.2,
+  "clients": 2
+}
+```
+
+`serial` says whether the **amplifier is replying**, not whether the USB cable is plugged in: `"up"` if a state frame or an RCU frame arrived within `polling.amp_alive_threshold` seconds (default 3), else `"down"`. The USB-serial port stays open while the amp is powered off, so this is the only message that tells a client the amp is off.
+
+**Use `serial` for your ON/OFF indication, not the arrival of a state message.** A client that shows "amp on" whenever it holds a state will show a false ON after the amp is switched off, and a power *toggle* built on that will send `power_off` when the operator wants `power_on`.
+
+**At connect** the server sends a new client:
+
+- amp replying: the current state (message 1), then a heartbeat with `"serial": "up"`;
+- amp silent: only a heartbeat with `"serial": "down"`. The last state the amp reported is **not** replayed (it was, up to and including v3.0.3).
 
 ### Client → Server
 

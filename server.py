@@ -7,11 +7,9 @@ a web-based remote control interface over WebSocket.
 """
 
 import asyncio
-import json
 import logging
 import signal
 import sys
-import time
 from pathlib import Path
 
 import tornado.ioloop
@@ -57,22 +55,18 @@ async def presence_heartbeat_loop(
     2. They see *something* flowing every ``interval`` seconds, which
        prevents heartbeat-based client reconnect loops (e.g. MacExpert
        reconnecting every 5 s when no msgs arrive).
+
+    A new client also gets this message once at connect (see
+    ``AmplifierWebSocket.open``), so it never waits for the next tick.
     """
     logger = logging.getLogger("spe.heartbeat")
     while True:
         try:
             await asyncio.sleep(interval)
-            alive = min(
-                serial_handler.last_state_age,
-                serial_handler.last_rcu_age,
-            ) < amp_alive_threshold
-            msg = json.dumps({
-                "heartbeat": True,
-                "serial": "up" if alive else "down",
-                "ts": time.time(),
-                "clients": len(AmplifierWebSocket.clients),
-            })
-            AmplifierWebSocket.broadcast_raw(msg)
+            alive = serial_handler.amp_alive(amp_alive_threshold)
+            AmplifierWebSocket.broadcast_raw(
+                AmplifierWebSocket.presence_json(alive)
+            )
         except asyncio.CancelledError:
             logger.info("presence_heartbeat_loop cancelled")
             break
@@ -152,6 +146,7 @@ def main() -> None:
         app_config=config,
         config_path=config_path,
         heartbeat=config.polling.heartbeat,
+        amp_alive_threshold=config.polling.amp_alive_threshold,
     )
 
     # GitHub release check: own daemon thread, first look ~60 s after
